@@ -240,8 +240,6 @@ func main() {
 		server.logger.Error("Error during shutdown", zap.Error(err))
 	}
 
-	select {
-	case <-ctx.Done():
-		server.logger.Info("Shutdown completed")
-	}
+	<-ctx.Done()
+	server.logger.Info("Shutdown completed")
 }
