@@ -15,14 +15,13 @@ import (
 type PaymentClient interface {
 	ProcessPayment(logger zap.SugaredLogger, request *PaymentRequest) error
 	GetStatus() PaymentClientState
-	Close()
+	Shutdown()
 }
 
 type paymentClient struct {
-	httpClient  *http.Client
-	state       PaymentClientState
-	changeState chan stateRequest
-	shutdown    chan struct{}
+	httpClient *http.Client
+	state      PaymentClientState
+	shutdown   chan struct{}
 
 	mu             sync.RWMutex
 	url            string
@@ -132,6 +131,6 @@ func (c *paymentClient) GetStatus() PaymentClientState {
 	return localCopy
 }
 
-func (c *paymentClient) Close() {
+func (c *paymentClient) Shutdown() {
 	close(c.shutdown)
 }

@@ -39,6 +39,27 @@ func NewServer() *Server {
 		port = "8080"
 	}
 
+	// Get payment processor URLs from environment variables
+	primaryURL := os.Getenv("PRIMARY_PAYMENT_PROCESSOR_URL")
+	if primaryURL == "" {
+		primaryURL = "http://payment-processor.example.com"
+	}
+
+	primaryHealthURL := os.Getenv("PRIMARY_PAYMENT_PROCESSOR_HEALTH_URL")
+	if primaryHealthURL == "" {
+		panic("PRIMARY_PAYMENT_PROCESSOR_HEALTH_URL not set")
+	}
+
+	fallbackURL := os.Getenv("FALLBACK_PAYMENT_PROCESSOR_URL")
+	if fallbackURL == "" {
+		panic("FALLBACK_PAYMENT_PROCESSOR_URL not set")
+	}
+
+	fallbackHealthURL := os.Getenv("FALLBACK_PAYMENT_PROCESSOR_HEALTH_URL")
+	if fallbackHealthURL == "" {
+		panic("FALLBACK_PAYMENT_PROCESSOR_HEALTH_URL not set")
+	}
+
 	// Initialize Zap logger with configuration
 	loggerConfig := NewLoggerConfig()
 	logger, err := InitLogger(loggerConfig)
@@ -46,6 +67,14 @@ func NewServer() *Server {
 	if err != nil {
 		panic("Failed to initialize logger: " + err.Error())
 	}
+
+	// Log the configured URLs
+	logger.Info("Payment processor configuration",
+		zap.String("primary_url", primaryURL),
+		zap.String("primary_health_url", primaryHealthURL),
+		zap.String("fallback_url", fallbackURL),
+		zap.String("fallback_health_url", fallbackHealthURL),
+	)
 
 	// Set Gin mode based on environment
 	if os.Getenv("GIN_MODE") == "" {
@@ -58,10 +87,26 @@ func NewServer() *Server {
 	router.Use(ginzap.Ginzap(logger, time.RFC3339, true))
 	router.Use(ginzap.RecoveryWithZap(logger, true))
 
+	// Create HTTP clients with timeouts
+	primaryHTTPClient := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	fallbackHTTPClient := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	// Create payment clients
+	primaryPaymentClient := pkg.NewPaymentClient(primaryHTTPClient, primaryURL, primaryHealthURL)
+	fallbackPaymentClient := pkg.NewPaymentClient(fallbackHTTPClient, fallbackURL, fallbackHealthURL)
+
+	// Create payment handler with both clients
+	paymentHandler := pkg.NewPaymentHandler(primaryPaymentClient, fallbackPaymentClient)
+
 	return &Server{
 		port:    port,
 		router:  router,
-		handler: &pkg.PaymentHandler{},
+		handler: paymentHandler,
 		logger:  logger,
 	}
 }
@@ -125,10 +170,7 @@ func (s *Server) setupRoutes() {
 
 		var paymentRequest pkg.PaymentRequest
 		if err := c.ShouldBindJSON(&paymentRequest); err != nil {
-			s.logger.Debug("Payment request received",
-				zap.String("client_ip", c.ClientIP()),
-				zap.String("user_agent", c.GetHeader("User-Agent")),
-			)
+			s.logger.Error("error on decode json", zap.Error(err))
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
 			return
 		}
@@ -137,14 +179,11 @@ func (s *Server) setupRoutes() {
 			Key:    "correlation_id",
 			Type:   zapcore.StringType,
 			String: paymentRequest.CorrelationID,
-		})
+		}).Sugar()
 
-		// Process payment (assuming the handler method exists)
 		err := s.handler.ProcessPayment(*scopedLogger, &paymentRequest)
 		if err != nil {
-			scopedLogger.Error("Failed to process payment",
-				zap.Error(err),
-			)
+			scopedLogger.Errorf("Failed to process payment %w", zap.Error(err))
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process payment"})
 			return
 		}
@@ -168,6 +207,7 @@ func (s *Server) Start() error {
 
 func (s *Server) Shutdown() error {
 	s.logger.Info("Shutting down server gracefully")
+	s.handler.Shutdown()
 	return s.logger.Sync()
 }
 
@@ -187,7 +227,6 @@ func main() {
 
 	server.logger.Info("Server started successfully. Press Ctrl+C to shutdown.")
 
-	// Wait for interrupt signal
 	<-c
 
 	server.logger.Info("Shutdown signal received")

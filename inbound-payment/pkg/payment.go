@@ -24,10 +24,10 @@ type PaymentRequest struct {
 }
 
 // POC Logic
-func (p *PaymentHandler) ProcessPayment(logger zap.Logger, request *PaymentRequest) error {
+func (p *PaymentHandler) ProcessPayment(logger zap.SugaredLogger, request *PaymentRequest) error {
 	primaryStatus := p.paymentProcessorClient.GetStatus()
 	if primaryStatus.available {
-		err := p.paymentProcessorClient.ProcessPayment(*logger.Sugar(), request)
+		err := p.paymentProcessorClient.ProcessPayment(logger, request)
 		if err == nil {
 			return nil
 		}
@@ -41,10 +41,15 @@ func (p *PaymentHandler) ProcessPayment(logger zap.Logger, request *PaymentReque
 		return fmt.Errorf("both primary and fallback payment processors are unavailable")
 	}
 
-	err := p.paymentProcessorFallbackClient.ProcessPayment(*logger.Sugar(), request)
+	err := p.paymentProcessorFallbackClient.ProcessPayment(logger, request)
 	if err != nil {
 		return fmt.Errorf("fallback payment processor failed: %w", err)
 	}
 
 	return nil
+}
+
+func (c *PaymentHandler) Shutdown() {
+	c.paymentProcessorClient.Shutdown()
+	c.paymentProcessorFallbackClient.Shutdown()
 }
