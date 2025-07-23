@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"os"
 	"os/signal"
@@ -9,23 +10,16 @@ import (
 	"time"
 
 	"github.com/claudiogodoy/gupers/payment-gateway/internal"
-	ginzap "github.com/gin-contrib/zap"
-	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
 
 type Server struct {
 	port    string
-	router  *gin.Engine
+	mux     *http.ServeMux
+	server  *http.Server
 	handler *internal.PaymentHandler
 	logger  *zap.Logger
-}
-
-type HealthResponse struct {
-	Status    string    `json:"status"`
-	Timestamp time.Time `json:"timestamp"`
-	Message   string    `json:"message"`
 }
 
 type ErrorResponse struct {
@@ -76,16 +70,8 @@ func NewServer() *Server {
 		zap.String("fallback_health_url", fallbackHealthURL),
 	)
 
-	// Set Gin mode based on environment
-	if os.Getenv("GIN_MODE") == "" {
-		gin.SetMode(gin.ReleaseMode)
-	}
-
-	router := gin.New()
-
-	// Add Zap middleware instead of default Gin logger
-	router.Use(ginzap.Ginzap(logger, time.RFC3339, true))
-	router.Use(ginzap.RecoveryWithZap(logger, true))
+	// Create HTTP mux
+	mux := http.NewServeMux()
 
 	// Create HTTP clients with timeouts
 	primaryHTTPClient := &http.Client{
@@ -103,94 +89,133 @@ func NewServer() *Server {
 	// Create payment handler with both clients
 	paymentHandler := internal.NewPaymentHandler(primaryPaymentClient, fallbackPaymentClient)
 
+	server := &http.Server{
+		Addr:         ":" + port,
+		Handler:      mux,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
 	return &Server{
 		port:    port,
-		router:  router,
+		mux:     mux,
+		server:  server,
 		handler: paymentHandler,
 		logger:  logger,
 	}
 }
 
-func (s *Server) healthHandler(c *gin.Context) {
-	s.logger.Info("Health check endpoint accessed",
-		zap.String("client_ip", c.ClientIP()),
-		zap.String("user_agent", c.GetHeader("User-Agent")),
-	)
-
-	response := HealthResponse{
-		Status:    "ok",
-		Timestamp: time.Now(),
-		Message:   "Go web server is running",
-	}
-
-	c.JSON(http.StatusOK, response)
-}
-
-func (s *Server) notFoundHandler(c *gin.Context) {
+func (s *Server) notFoundHandler(w http.ResponseWriter, r *http.Request) {
 	s.logger.Warn("Route not found",
-		zap.String("path", c.Request.URL.Path),
-		zap.String("method", c.Request.Method),
-		zap.String("client_ip", c.ClientIP()),
+		zap.String("path", r.URL.Path),
+		zap.String("method", r.Method),
 	)
 
 	response := ErrorResponse{
 		Error:   "Not Found",
-		Message: "The requested path '" + c.Request.URL.Path + "' was not found",
+		Message: "The requested path '" + r.URL.Path + "' was not found",
 	}
 
-	c.JSON(http.StatusNotFound, response)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotFound)
+	json.NewEncoder(w).Encode(response)
 }
 
-func (s *Server) methodNotAllowedHandler(c *gin.Context) {
-	s.logger.Warn("Method not allowed",
-		zap.String("path", c.Request.URL.Path),
-		zap.String("method", c.Request.Method),
-		zap.String("client_ip", c.ClientIP()),
-	)
-
-	response := ErrorResponse{
-		Error:   "Method Not Allowed",
-		Message: "Method '" + c.Request.Method + "' is not allowed for this endpoint",
+func (s *Server) paymentsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		return
 	}
 
-	c.JSON(http.StatusMethodNotAllowed, response)
+	s.logger.Debug("Payment request received")
+
+	var paymentRequest internal.PaymentRequest
+	if err := json.NewDecoder(r.Body).Decode(&paymentRequest); err != nil {
+		s.logger.Error("error on decode json", zap.Error(err))
+
+		response := ErrorResponse{
+			Error:   "Invalid request body",
+			Message: "Failed to decode JSON request",
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	scopedLogger := s.logger.With(zapcore.Field{
+		Key:    "correlation_id",
+		Type:   zapcore.StringType,
+		String: paymentRequest.CorrelationID,
+	}).Sugar()
+
+	err := s.handler.ProcessPayment(*scopedLogger, &paymentRequest)
+	if err != nil {
+		scopedLogger.Errorf("Failed to process payment: %v", err)
+
+		response := ErrorResponse{
+			Error:   "Failed to process payment",
+			Message: "Payment processing failed",
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	scopedLogger.Debug("Payment processed successfully")
+
+	response := map[string]string{"status": "processed"}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
 }
 
 func (s *Server) setupRoutes() {
-	// Handle 404 errors
-	s.router.NoRoute(s.notFoundHandler)
-	s.router.NoMethod(s.methodNotAllowedHandler)
+	s.mux.HandleFunc("/payments", s.withMiddleware(s.paymentsHandler))
 
-	s.router.GET("/health", s.healthHandler)
-	s.router.POST("/payments", func(c *gin.Context) {
-		s.logger.Debug("Payment request received",
-			zap.String("client_ip", c.ClientIP()),
-			zap.String("user_agent", c.GetHeader("User-Agent")),
+	// Handle all other routes as 404
+	s.mux.HandleFunc("/", s.withMiddleware(s.notFoundHandler))
+}
+
+// Middleware wrapper for logging and recovery
+func (s *Server) withMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		// Recovery middleware
+		defer func() {
+			if err := recover(); err != nil {
+				s.logger.Error("Panic recovered",
+					zap.Any("error", err),
+					zap.String("path", r.URL.Path),
+					zap.String("method", r.Method),
+				)
+
+				response := ErrorResponse{
+					Error:   "Internal Server Error",
+					Message: "An unexpected error occurred",
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(response)
+			}
+		}()
+
+		// Call the next handler
+		next(w, r)
+
+		// Log request
+		duration := time.Since(start)
+		s.logger.Info("Request completed",
+			zap.String("method", r.Method),
+			zap.String("path", r.URL.Path),
+			zap.Duration("duration", duration),
 		)
-
-		var paymentRequest internal.PaymentRequest
-		if err := c.ShouldBindJSON(&paymentRequest); err != nil {
-			s.logger.Error("error on decode json", zap.Error(err))
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
-			return
-		}
-
-		scopedLogger := s.logger.With(zapcore.Field{
-			Key:    "correlation_id",
-			Type:   zapcore.StringType,
-			String: paymentRequest.CorrelationID,
-		}).Sugar()
-
-		err := s.handler.ProcessPayment(*scopedLogger, &paymentRequest)
-		if err != nil {
-			scopedLogger.Errorf("Failed to process payment %w", zap.Error(err))
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process payment"})
-			return
-		}
-
-		scopedLogger.Debug("Payment processed successfully")
-		c.JSON(http.StatusOK, gin.H{"status": "processed"})
-	})
+	}
 }
 
 func (s *Server) Start() error {
@@ -202,12 +227,18 @@ func (s *Server) Start() error {
 		zap.String("payments_endpoint", "http://localhost:"+s.port+"/payments"),
 	)
 
-	return s.router.Run(":" + s.port)
+	return s.server.ListenAndServe()
 }
 
-func (s *Server) Shutdown() error {
+func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.Info("Shutting down server gracefully")
 	s.handler.Shutdown()
+
+	// Shutdown the HTTP server with context
+	if err := s.server.Shutdown(ctx); err != nil {
+		return err
+	}
+
 	return s.logger.Sync()
 }
 
@@ -236,7 +267,7 @@ func main() {
 	defer cancel()
 
 	// Shutdown server
-	if err := server.Shutdown(); err != nil {
+	if err := server.Shutdown(ctx); err != nil {
 		server.logger.Error("Error during shutdown", zap.Error(err))
 	}
 
