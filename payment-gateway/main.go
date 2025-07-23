@@ -83,11 +83,11 @@ func NewServer() *Server {
 	}
 
 	// Create payment clients
-	primaryPaymentClient := internal.NewPaymentClient(primaryHTTPClient, primaryURL, primaryHealthURL)
-	fallbackPaymentClient := internal.NewPaymentClient(fallbackHTTPClient, fallbackURL, fallbackHealthURL)
+	primaryPaymentClient := internal.NewPaymentClient(primaryHTTPClient, primaryURL, primaryHealthURL, logger.Sugar())
+	fallbackPaymentClient := internal.NewPaymentClient(fallbackHTTPClient, fallbackURL, fallbackHealthURL, logger.Sugar())
 
 	// Create payment handler with both clients
-	paymentHandler := internal.NewPaymentHandler(primaryPaymentClient, fallbackPaymentClient)
+	paymentHandler := internal.NewPaymentHandler(primaryPaymentClient, fallbackPaymentClient, logger.Sugar())
 
 	server := &http.Server{
 		Addr:         ":" + port,
@@ -104,22 +104,6 @@ func NewServer() *Server {
 		handler: paymentHandler,
 		logger:  logger,
 	}
-}
-
-func (s *Server) notFoundHandler(w http.ResponseWriter, r *http.Request) {
-	s.logger.Warn("Route not found",
-		zap.String("path", r.URL.Path),
-		zap.String("method", r.Method),
-	)
-
-	response := ErrorResponse{
-		Error:   "Not Found",
-		Message: "The requested path '" + r.URL.Path + "' was not found",
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusNotFound)
-	json.NewEncoder(w).Encode(response)
 }
 
 func (s *Server) paymentsHandler(w http.ResponseWriter, r *http.Request) {
@@ -145,11 +129,12 @@ func (s *Server) paymentsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	scopedLogger := s.logger.With(zapcore.Field{
-		Key:    "correlation_id",
+		Key:    "CorrelationId",
 		Type:   zapcore.StringType,
 		String: paymentRequest.CorrelationID,
 	}).Sugar()
 
+	scopedLogger.Infof("processing payment: %s", paymentRequest)
 	err := s.handler.ProcessPayment(*scopedLogger, &paymentRequest)
 	if err != nil {
 		scopedLogger.Errorf("Failed to process payment: %v", err)
@@ -174,48 +159,7 @@ func (s *Server) paymentsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) setupRoutes() {
-	s.mux.HandleFunc("/payments", s.withMiddleware(s.paymentsHandler))
-
-	// Handle all other routes as 404
-	s.mux.HandleFunc("/", s.withMiddleware(s.notFoundHandler))
-}
-
-// Middleware wrapper for logging and recovery
-func (s *Server) withMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-
-		// Recovery middleware
-		defer func() {
-			if err := recover(); err != nil {
-				s.logger.Error("Panic recovered",
-					zap.Any("error", err),
-					zap.String("path", r.URL.Path),
-					zap.String("method", r.Method),
-				)
-
-				response := ErrorResponse{
-					Error:   "Internal Server Error",
-					Message: "An unexpected error occurred",
-				}
-
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusInternalServerError)
-				json.NewEncoder(w).Encode(response)
-			}
-		}()
-
-		// Call the next handler
-		next(w, r)
-
-		// Log request
-		duration := time.Since(start)
-		s.logger.Info("Request completed",
-			zap.String("method", r.Method),
-			zap.String("path", r.URL.Path),
-			zap.Duration("duration", duration),
-		)
-	}
+	s.mux.HandleFunc("/payments", s.paymentsHandler)
 }
 
 func (s *Server) Start() error {

@@ -1,0 +1,38 @@
+# Git
+.git
+.gitignore
+
+# Documentation
+README.md
+*.md
+
+# Development files
+.vscode
+.idea
+
+# Build artifacts
+server
+main
+*.exe
+
+# Logs
+*.log
+
+# Test files
+*_test.go
+
+# Environment files
+.env
+.env.*
+
+# Docker files (except Dockerfile)
+docker-compose.yml
+docker-compose.yaml
+
+# Temporary files
+*.tmp
+*.temp
+
+# OS generated files
+.DS_Store
+Thumbs.db

@@ -2,6 +2,7 @@ package internal
 
 import (
 	"fmt"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -9,18 +10,21 @@ import (
 type PaymentHandler struct {
 	paymentProcessorClient         PaymentClient
 	paymentProcessorFallbackClient PaymentClient
+	serverLogger                   *zap.SugaredLogger
 }
 
-func NewPaymentHandler(paymentProcessorClient, paymentProcessorFallbackClient PaymentClient) *PaymentHandler {
+func NewPaymentHandler(paymentProcessorClient, paymentProcessorFallbackClient PaymentClient, logger *zap.SugaredLogger) *PaymentHandler {
 	return &PaymentHandler{
 		paymentProcessorClient:         paymentProcessorClient,
 		paymentProcessorFallbackClient: paymentProcessorFallbackClient,
+		serverLogger:                   logger,
 	}
 }
 
 type PaymentRequest struct {
-	Amount        float64 `json:"amount"`
-	CorrelationID string  `json:"correlation_id"`
+	Amount        float64
+	CorrelationID string
+	RequestedAt   time.Time
 }
 
 // POC Logic
