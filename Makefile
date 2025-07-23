@@ -1,9 +1,10 @@
-.PHONY: build run run-dev test clean docker-build docker-run fmt lint deps help
+.PHONY: build run run-dev test test-local clean docker-build docker-run up down dc-build
 
 # Variables
 BINARY_NAME=server
 DOCKER_IMAGE=go-server
 PORT=8080
+PAYMENT_GATEWAY_DIR=payment-gateway
 
 # Payment processor configuration
 PRIMARY_PAYMENT_PROCESSOR_URL=http://payment-processor.example.com/process
@@ -14,12 +15,12 @@ FALLBACK_PAYMENT_PROCESSOR_HEALTH_URL=http://payment-processor-fallback.example.
 # Build the application
 build:
 	@echo "Building $(BINARY_NAME)..."
-	@go build -o $(BINARY_NAME) .
+	@cd $(PAYMENT_GATEWAY_DIR) && go build -o $(BINARY_NAME) .
 
 # Run the application
 run:
 	@echo "Running server on port $(PORT)..."
-	@PORT=$(PORT) \
+	@cd $(PAYMENT_GATEWAY_DIR) && PORT=$(PORT) \
 	 PRIMARY_PAYMENT_PROCESSOR_URL=$(PRIMARY_PAYMENT_PROCESSOR_URL) \
 	 PRIMARY_PAYMENT_PROCESSOR_HEALTH_URL=$(PRIMARY_PAYMENT_PROCESSOR_HEALTH_URL) \
 	 FALLBACK_PAYMENT_PROCESSOR_URL=$(FALLBACK_PAYMENT_PROCESSOR_URL) \
@@ -29,29 +30,32 @@ run:
 # Run with development settings
 run-dev:
 	@echo "Running server in development mode on port $(PORT)..."
-	@PORT=$(PORT) \
-	 GIN_MODE=debug \
-	 PRIMARY_PAYMENT_PROCESSOR_URL=http://localhost:9001/process \
-	 PRIMARY_PAYMENT_PROCESSOR_HEALTH_URL=http://localhost:9001/health_check \
-	 FALLBACK_PAYMENT_PROCESSOR_URL=http://localhost:9002/process \
-	 FALLBACK_PAYMENT_PROCESSOR_HEALTH_URL=http://localhost:9002/health_check \
+	@cd $(PAYMENT_GATEWAY_DIR) && PORT=$(PORT) \
+	 PRIMARY_PAYMENT_PROCESSOR_URL=http://localhost:9001/payments \
+	 PRIMARY_PAYMENT_PROCESSOR_HEALTH_URL=http://localhost:9001/payments/service-health \
+	 FALLBACK_PAYMENT_PROCESSOR_URL=http://localhost:9002/payments \
+	 FALLBACK_PAYMENT_PROCESSOR_HEALTH_URL=http://localhost:9002/payments/service-health \
 	 go run main.go
 
 # Run tests (when tests are added)
 test:
 	@echo "Running tests..."
-	@go test -v ./...
+	@cd $(PAYMENT_GATEWAY_DIR) && go test -v ./...
 
-# Clean build artifacts
-clean:
-	@echo "Cleaning..."
-	@rm -f $(BINARY_NAME)
-	@go clean
+# Test local deployment with curl
+post-payment:
+	@echo "Testing payment endpoint via Envoy load balancer..."
+	@echo "Making POST request to http://localhost:9999/payments"
+	@curl -X POST http://localhost:9999/payments \
+		-H "Content-Type: application/json" \
+		-d '{"CorrelationId": "$(shell uuidgen)", "Amount": 100.50}' \
+		-w "\nHTTP Status: %{http_code}\nResponse Time: %{time_total}s\n" \
+		-s || echo "Error: Make sure the services are running with 'make docker-up'"
 
 # Build Docker image
 docker-build:
 	@echo "Building Docker image $(DOCKER_IMAGE)..."
-	@docker build -t $(DOCKER_IMAGE) .
+	@cd $(PAYMENT_GATEWAY_DIR) && docker build -t $(DOCKER_IMAGE) .
 
 # Run Docker container
 docker-run: docker-build
@@ -63,21 +67,17 @@ docker-run: docker-build
 	 -e FALLBACK_PAYMENT_PROCESSOR_HEALTH_URL=$(FALLBACK_PAYMENT_PROCESSOR_HEALTH_URL) \
 	 $(DOCKER_IMAGE)
 
-# Format code
-fmt:
-	@echo "Formatting code..."
-	@go fmt ./...
+dc-build:
+	@echo "building all services with Docker Compose..."
+	@docker-compose build
 
-# Lint code (requires golangci-lint)
-lint:
-	@echo "Linting code..."
-	@golangci-lint run
+up: dc-build
+	@echo "Starting all services with Docker Compose..."
+	@docker-compose up -d
 
-# Download dependencies
-deps:
-	@echo "Downloading dependencies..."
-	@go mod download
-	@go mod tidy
+down:
+	@echo "Stopping all services..."
+	@docker-compose down
 
 # Show help
 help:
@@ -85,13 +85,13 @@ help:
 	@echo "  build        - Build the application"
 	@echo "  run          - Run the application with production settings"
 	@echo "  run-dev      - Run the application with development settings"
-	@echo "  test         - Run tests"
-	@echo "  clean        - Clean build artifacts"
+	@echo "  test         - Run unit tests"
+	@echo "  post-payment   - Test payment endpoint via Envoy load balancer (requires services running)"
 	@echo "  docker-build - Build Docker image"
 	@echo "  docker-run   - Build and run Docker container"
-	@echo "  fmt          - Format code"
-	@echo "  lint         - Lint code"
-	@echo "  deps         - Download and tidy dependencies"
+	@echo "  dc-build    - build all services with Docker Compose"
+	@echo "  up    - Start all services with Docker Compose"
+	@echo "  down  - Stop all services"
 	@echo "  help         - Show this help"
 	@echo ""
 	@echo "Environment Variables:"
@@ -100,4 +100,8 @@ help:
 	@echo "  PRIMARY_PAYMENT_PROCESSOR_HEALTH_URL    - Primary payment processor health check URL"
 	@echo "  FALLBACK_PAYMENT_PROCESSOR_URL          - Fallback payment processor URL"
 	@echo "  FALLBACK_PAYMENT_PROCESSOR_HEALTH_URL   - Fallback payment processor health check URL"
-	@echo "  GIN_MODE                                - Gin mode (debug/release)"
+	@echo ""
+	@echo "Quick Start:"
+	@echo "  make up    # Start all services"
+	@echo "  make post-payment   # Test the payment endpoint"
+	@echo "  make down  # Stop services"

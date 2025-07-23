@@ -18,10 +18,16 @@ type PaymentClient interface {
 	Shutdown()
 }
 
+type ServicesAvailabilityWireResponse struct {
+	Failing         bool `json:"failing"`
+	MinResponseTime int  `json:"minResponseTime"`
+}
+
 type paymentClient struct {
-	httpClient *http.Client
-	state      PaymentClientState
-	shutdown   chan struct{}
+	httpClient   *http.Client
+	state        PaymentClientState
+	shutdown     chan struct{}
+	serverLogger *zap.SugaredLogger
 
 	mu             sync.RWMutex
 	url            string
@@ -33,7 +39,7 @@ type PaymentClientState struct {
 	available bool
 }
 
-func NewPaymentClient(httpClient *http.Client, url, healthCheckUrl string) PaymentClient {
+func NewPaymentClient(httpClient *http.Client, url, healthCheckUrl string, logger *zap.SugaredLogger) PaymentClient {
 	client := &paymentClient{
 		httpClient: httpClient,
 		state: PaymentClientState{available: true,
@@ -41,6 +47,7 @@ func NewPaymentClient(httpClient *http.Client, url, healthCheckUrl string) Payme
 		shutdown:       make(chan struct{}),
 		url:            url,
 		healthCheckURL: healthCheckUrl,
+		serverLogger:   logger,
 	}
 
 	go client.monitorClient()
@@ -72,26 +79,36 @@ func (c *paymentClient) update(available bool, timeTaken time.Duration) {
 }
 
 func (c *paymentClient) performHealthCheck() {
-	// TODO: verify if the health check time is going to be correlated with response time,
-	// if not we should not track time here
-	since := time.Now()
-	var err error
-	defer func() {
-		timeTaken := time.Since(since)
-		c.update(err == nil, timeTaken)
-	}()
-
+	c.serverLogger.Infof("health checking endpoint %s", c.healthCheckURL)
 	resp, err := c.httpClient.Get(c.healthCheckURL)
 	if err != nil {
+		c.serverLogger.Errorf("endpoint %s unavailable", c.healthCheckURL)
+		c.update(false, -1)
 		return
 	}
 	defer resp.Body.Close()
 
-}
+	if resp.StatusCode != http.StatusOK {
+		c.serverLogger.Errorf("endpoint %s unavailable", c.healthCheckURL)
+		c.update(false, -1)
+		return
+	}
 
-type stateRequest struct {
-	available bool
-	duration  time.Duration
+	var healthResp ServicesAvailabilityWireResponse
+	if err := json.NewDecoder(resp.Body).Decode(&healthResp); err != nil {
+		c.update(false, -1)
+		return
+	}
+
+	available := !healthResp.Failing
+	var duration time.Duration
+	if healthResp.MinResponseTime > 0 {
+		duration = time.Duration(healthResp.MinResponseTime) * time.Millisecond
+	}
+
+	c.serverLogger.Infof("health-check endpoint %s completed - available %s - respTime %s", c.healthCheckURL, available, healthResp.MinResponseTime)
+
+	c.update(available, duration)
 }
 
 func (c *paymentClient) ProcessPayment(logger zap.SugaredLogger, request *PaymentRequest) error {
@@ -102,6 +119,7 @@ func (c *paymentClient) ProcessPayment(logger zap.SugaredLogger, request *Paymen
 		c.update(err == nil, timeTaken)
 	}()
 
+	request.RequestedAt = time.Now()
 	jsonData, err := json.Marshal(request)
 	if err != nil {
 		logger.Errorf("failed to marshal request: %w", err)

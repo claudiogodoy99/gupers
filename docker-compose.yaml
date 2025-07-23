@@ -68,9 +68,79 @@ services:
     container_name: payment-processor-fallback-db
     hostname: payment-processor-fallback-db
 
+  # Load Balancer (Envoy)
+  envoy:
+    image: envoyproxy/envoy:v1.28-latest
+    container_name: payment-gateway-envoy
+    hostname: payment-gateway-envoy
+    ports:
+      - "9999:10000"
+    volumes:
+      - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    depends_on:
+      - payment-gateway-1
+      - payment-gateway-2
+    networks:
+      - payment-processor
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: "50MB"
+
+  # Payment Gateway Instance 1
+  payment-gateway-1:
+    build:
+      context: ./payment-gateway
+      dockerfile: Dockerfile
+    container_name: payment-gateway-1
+    hostname: payment-gateway-1
+    environment:
+      - PORT=8080
+      - PRIMARY_PAYMENT_PROCESSOR_URL=http://payment-processor-default:8080/payments
+      - PRIMARY_PAYMENT_PROCESSOR_HEALTH_URL=http://payment-processor-default:8080/payments/service-health
+      - FALLBACK_PAYMENT_PROCESSOR_URL=http://payment-processor-fallback:8080/payments
+      - FALLBACK_PAYMENT_PROCESSOR_HEALTH_URL=http://payment-processor-fallback:8080/payments/service-health
+    depends_on:
+      - payment-processor-1
+      - payment-processor-2
+    networks:
+      - payment-processor
+    deploy:
+      resources:
+        limits:
+          cpus: "0.6"
+          memory: "100MB"
+
+  # Payment Gateway Instance 2
+  payment-gateway-2:
+    build:
+      context: ./payment-gateway
+      dockerfile: Dockerfile
+    container_name: payment-gateway-2
+    hostname: payment-gateway-2
+    environment:
+      - PORT=8080
+      - PRIMARY_PAYMENT_PROCESSOR_URL=http://payment-processor-default:8080/payments
+      - PRIMARY_PAYMENT_PROCESSOR_HEALTH_URL=http://payment-processor-default:8080/payments/service-health
+      - FALLBACK_PAYMENT_PROCESSOR_URL=http://payment-processor-fallback:8080/payments
+      - FALLBACK_PAYMENT_PROCESSOR_HEALTH_URL=http://payment-processor-fallback:8080/payments/service-health
+    depends_on:
+      - payment-processor-1
+      - payment-processor-2
+    networks:
+      - payment-processor
+    deploy:
+      resources:
+        limits:
+          cpus: "0.6"
+          memory: "100MB"
+          
 networks:
   payment-processor:
     name: payment-processor
     driver: bridge
   payment-processor-db:
+    driver: bridge
+  payment-gateway-db:
     driver: bridge
