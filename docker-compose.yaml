@@ -68,6 +68,10 @@ services:
     container_name: payment-processor-fallback-db
     hostname: payment-processor-fallback-db
 
+# TODO: nossa aplicação - CLAUDIOGODOY
+
+# TODO: configurar postgress
+
 networks:
   payment-processor:
     name: payment-processor
