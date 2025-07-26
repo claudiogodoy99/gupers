@@ -79,7 +79,7 @@ func (c *paymentClient) update(available bool, timeTaken time.Duration) {
 }
 
 func (c *paymentClient) performHealthCheck() {
-	c.serverLogger.Infof("health checking endpoint %s", c.healthCheckURL)
+	c.serverLogger.Debugf("health checking endpoint %s", c.healthCheckURL)
 	resp, err := c.httpClient.Get(c.healthCheckURL)
 	if err != nil {
 		c.serverLogger.Errorf("endpoint %s unavailable", c.healthCheckURL)
@@ -106,7 +106,7 @@ func (c *paymentClient) performHealthCheck() {
 		duration = time.Duration(healthResp.MinResponseTime) * time.Millisecond
 	}
 
-	c.serverLogger.Infof("health-check endpoint %s completed - available %s - respTime %s", c.healthCheckURL, available, healthResp.MinResponseTime)
+	c.serverLogger.Debugf("health-check endpoint %s completed - available %s - respTime %s", c.healthCheckURL, available, healthResp.MinResponseTime)
 
 	c.update(available, duration)
 }
@@ -138,6 +138,7 @@ func (c *paymentClient) ProcessPayment(logger zap.SugaredLogger, request *Paymen
 		return err
 	}
 
+	logger.Info("success payment processed")
 	return nil
 }
 

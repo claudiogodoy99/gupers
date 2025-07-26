@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -86,8 +87,32 @@ func NewServer() *Server {
 	primaryPaymentClient := internal.NewPaymentClient(primaryHTTPClient, primaryURL, primaryHealthURL, logger.Sugar())
 	fallbackPaymentClient := internal.NewPaymentClient(fallbackHTTPClient, fallbackURL, fallbackHealthURL, logger.Sugar())
 
+	// Get channel length and number of workers from environment variables
+	channelLen := 10 // default value
+	if channelLenStr := os.Getenv("PAYMENT_CHANNEL_LEN"); channelLenStr != "" {
+		if val, err := strconv.Atoi(channelLenStr); err == nil {
+			channelLen = val
+		} else {
+			logger.Warn("Invalid PAYMENT_CHANNEL_LEN, using default", zap.String("value", channelLenStr), zap.Int("default", channelLen))
+		}
+	}
+
+	numWorkers := 10 // default value
+	if numWorkersStr := os.Getenv("PAYMENT_NUM_WORKERS"); numWorkersStr != "" {
+		if val, err := strconv.Atoi(numWorkersStr); err == nil {
+			numWorkers = val
+		} else {
+			logger.Warn("Invalid PAYMENT_NUM_WORKERS, using default", zap.String("value", numWorkersStr), zap.Int("default", numWorkers))
+		}
+	}
+
+	logger.Info("Payment handler configuration",
+		zap.Int("channel_len", channelLen),
+		zap.Int("num_workers", numWorkers),
+	)
+
 	// Create payment handler with both clients
-	paymentHandler := internal.NewPaymentHandler(primaryPaymentClient, fallbackPaymentClient, logger.Sugar())
+	paymentHandler := internal.NewPaymentHandler(primaryPaymentClient, fallbackPaymentClient, channelLen, numWorkers, logger.Sugar())
 
 	server := &http.Server{
 		Addr:         ":" + port,
@@ -135,7 +160,7 @@ func (s *Server) paymentsHandler(w http.ResponseWriter, r *http.Request) {
 	}).Sugar()
 
 	scopedLogger.Infof("processing payment: %s", paymentRequest)
-	err := s.handler.ProcessPayment(*scopedLogger, &paymentRequest)
+	err := s.handler.ProcessPayment(scopedLogger, &paymentRequest)
 	if err != nil {
 		scopedLogger.Errorf("Failed to process payment: %v", err)
 
