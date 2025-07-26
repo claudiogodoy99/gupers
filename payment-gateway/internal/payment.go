@@ -1,7 +1,6 @@
 package internal
 
 import (
-	"fmt"
 	"time"
 
 	"go.uber.org/zap"
@@ -11,14 +10,29 @@ type PaymentHandler struct {
 	paymentProcessorClient         PaymentClient
 	paymentProcessorFallbackClient PaymentClient
 	serverLogger                   *zap.SugaredLogger
+	pendingPaymentChan             chan *PendingRequest
+	shutdown                       chan struct{}
 }
 
-func NewPaymentHandler(paymentProcessorClient, paymentProcessorFallbackClient PaymentClient, logger *zap.SugaredLogger) *PaymentHandler {
-	return &PaymentHandler{
+func NewPaymentHandler(paymentProcessorClient, paymentProcessorFallbackClient PaymentClient, chanLen, numWorkers int, logger *zap.SugaredLogger) *PaymentHandler {
+	payment := &PaymentHandler{
 		paymentProcessorClient:         paymentProcessorClient,
 		paymentProcessorFallbackClient: paymentProcessorFallbackClient,
 		serverLogger:                   logger,
+		pendingPaymentChan:             make(chan *PendingRequest, chanLen),
+		shutdown:                       make(chan struct{}),
 	}
+
+	for range numWorkers {
+		go payment.processPaymentAsync()
+	}
+
+	return payment
+}
+
+type PendingRequest struct {
+	request *PaymentRequest
+	logger  *zap.SugaredLogger
 }
 
 type PaymentRequest struct {
@@ -27,33 +41,54 @@ type PaymentRequest struct {
 	RequestedAt   time.Time
 }
 
-// POC Logic
-func (p *PaymentHandler) ProcessPayment(logger zap.SugaredLogger, request *PaymentRequest) error {
-	primaryStatus := p.paymentProcessorClient.GetStatus()
-	if primaryStatus.available {
-		err := p.paymentProcessorClient.ProcessPayment(logger, request)
-		if err == nil {
+func (p *PaymentHandler) ProcessPayment(logger *zap.SugaredLogger, request *PaymentRequest) error {
+	logger.Debugf("received request, adding into channel - channel len (%d)", len(p.pendingPaymentChan))
+
+	req := &PendingRequest{
+		request: request,
+		logger:  logger,
+	}
+
+	ticker := time.Tick(100 * time.Millisecond)
+
+	for {
+		select {
+		case p.pendingPaymentChan <- req:
+			return nil
+		case <-ticker:
+			logger.Warnf("taking too long to add request on channel - channel len (%d)", len(p.pendingPaymentChan))
+		case <-p.shutdown:
 			return nil
 		}
-	} else {
-		logger.Warn("Primary payment processor unavailable, using fallback")
 	}
+}
 
-	// Try fallback client
-	fallbackStatus := p.paymentProcessorFallbackClient.GetStatus()
-	if !fallbackStatus.available {
-		return fmt.Errorf("both primary and fallback payment processors are unavailable")
+func (p *PaymentHandler) processPaymentAsync() {
+	for {
+		select {
+		case pending := <-p.pendingPaymentChan:
+			client := p.selectBestClient()
+
+			err := client.ProcessPayment(*pending.logger, pending.request)
+			if err != nil {
+				pending.logger.Info("error on pending request, trying to put on channel again")
+				go p.ProcessPayment(pending.logger, pending.request)
+			}
+			//TODO db integration
+		case <-p.shutdown:
+			return
+		}
 	}
+}
 
-	err := p.paymentProcessorFallbackClient.ProcessPayment(logger, request)
-	if err != nil {
-		return fmt.Errorf("fallback payment processor failed: %w", err)
-	}
-
-	return nil
+// TODO
+func (p *PaymentHandler) selectBestClient() PaymentClient {
+	return p.paymentProcessorClient
 }
 
 func (c *PaymentHandler) Shutdown() {
 	c.paymentProcessorClient.Shutdown()
 	c.paymentProcessorFallbackClient.Shutdown()
+
+	close(c.shutdown)
 }
