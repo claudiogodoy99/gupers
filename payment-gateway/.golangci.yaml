@@ -1,0 +1,30 @@
+version: "2"
+linters:
+  default: all
+  disable:
+    - exhaustruct
+    - wsl
+  settings:
+    depguard:
+      rules:
+        main:
+          files:
+            - $all
+            - '!$test'
+          allow:
+            - $gostd
+        test:
+          files:
+            - $test
+          allow:
+            - $gostd
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  uniq-by-line: false
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports

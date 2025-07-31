@@ -1,25 +1,37 @@
 package internal
 
 import (
+	"context"
+	"log/slog"
 	"time"
-
-	"go.uber.org/zap"
 )
 
+const (
+	tickerInterval = 100
+)
+
+// PaymentHandler manages payment processing with primary and fallback clients
+// using a fan-in/fan-out pattern for latency.
 type PaymentHandler struct {
 	paymentProcessorClient         PaymentClient
 	paymentProcessorFallbackClient PaymentClient
-	serverLogger                   *zap.SugaredLogger
-	pendingPaymentChan             chan *PendingRequest
+	logger                         *slog.Logger
+	pendingPaymentChan             chan *PaymentRequest
 	shutdown                       chan struct{}
 }
 
-func NewPaymentHandler(paymentProcessorClient, paymentProcessorFallbackClient PaymentClient, chanLen, numWorkers int, logger *zap.SugaredLogger) *PaymentHandler {
+// NewPaymentHandler creates a new payment handler with the specified clients and worker configuration.
+// It starts the specified number of workers to process payments asynchronously.
+func NewPaymentHandler(
+	paymentProcessorClient, paymentProcessorFallbackClient PaymentClient,
+	chanLen, numWorkers int,
+	logger *slog.Logger,
+) *PaymentHandler {
 	payment := &PaymentHandler{
 		paymentProcessorClient:         paymentProcessorClient,
 		paymentProcessorFallbackClient: paymentProcessorFallbackClient,
-		serverLogger:                   logger,
-		pendingPaymentChan:             make(chan *PendingRequest, chanLen),
+		logger:                         logger,
+		pendingPaymentChan:             make(chan *PaymentRequest, chanLen),
 		shutdown:                       make(chan struct{}),
 	}
 
@@ -30,65 +42,66 @@ func NewPaymentHandler(paymentProcessorClient, paymentProcessorFallbackClient Pa
 	return payment
 }
 
-type PendingRequest struct {
-	request *PaymentRequest
-	logger  *zap.SugaredLogger
-}
-
+// PaymentRequest represents a payment processing request with amount, correlation ID, and timestamp.
 type PaymentRequest struct {
-	Amount        float64
-	CorrelationID string
-	RequestedAt   time.Time
+	Amount        float64   `json:"amount"`
+	CorrelationID string    `json:"correlationId"`
+	RequestedAt   time.Time `json:"requestedAt"`
 }
 
-func (p *PaymentHandler) ProcessPayment(logger *zap.SugaredLogger, request *PaymentRequest) error {
-	logger.Debugf("received request, adding into channel - channel len (%d)", len(p.pendingPaymentChan))
+// ProcessPayment queues a payment request for asynchronous processing.
+// It returns an error if the system is shutting down.
+func (p *PaymentHandler) ProcessPayment(request *PaymentRequest) error {
+	ctx := context.Background()
+	p.logger.DebugContext(ctx, "received request, adding into channel",
+		slog.Int("channel_len", len(p.pendingPaymentChan)))
 
-	req := &PendingRequest{
-		request: request,
-		logger:  logger,
-	}
-
-	ticker := time.Tick(100 * time.Millisecond)
+	ticker := time.Tick(tickerInterval * time.Millisecond)
 
 	for {
 		select {
-		case p.pendingPaymentChan <- req:
+		case p.pendingPaymentChan <- request:
 			return nil
 		case <-ticker:
-			logger.Warnf("taking too long to add request on channel - channel len (%d)", len(p.pendingPaymentChan))
+			p.logger.WarnContext(ctx, "taking too long to add request on channel",
+				slog.Int("channel_len", len(p.pendingPaymentChan)))
 		case <-p.shutdown:
 			return nil
 		}
 	}
 }
 
+// Shutdown gracefully stops the payment handler and closes all connections.
+func (p *PaymentHandler) Shutdown() {
+	p.paymentProcessorClient.Shutdown()
+	p.paymentProcessorFallbackClient.Shutdown()
+
+	close(p.shutdown)
+}
+
 func (p *PaymentHandler) processPaymentAsync() {
+	ctx := context.Background()
+
 	for {
 		select {
-		case pending := <-p.pendingPaymentChan:
+		case request := <-p.pendingPaymentChan:
 			client := p.selectBestClient()
 
-			err := client.ProcessPayment(*pending.logger, pending.request)
+			err := client.ProcessPayment(request)
 			if err != nil {
-				pending.logger.Info("error on pending request, trying to put on channel again")
-				go p.ProcessPayment(pending.logger, pending.request)
+				p.logger.InfoContext(ctx, "error on pending request, trying to put on channel again")
+
+				go func() {
+					_ = p.ProcessPayment(request)
+				}()
 			}
-			//TODO db integration
 		case <-p.shutdown:
 			return
 		}
 	}
 }
 
-// TODO
+//nolint:ireturn // Interface return is intentional for polymorphism
 func (p *PaymentHandler) selectBestClient() PaymentClient {
 	return p.paymentProcessorClient
-}
-
-func (c *PaymentHandler) Shutdown() {
-	c.paymentProcessorClient.Shutdown()
-	c.paymentProcessorFallbackClient.Shutdown()
-
-	close(c.shutdown)
 }
