@@ -198,10 +198,9 @@ func NewServer() *Server {
 
 	paymentHandler := internal.NewPaymentHandler(router, workerConfig.numWorkers, channel, logger)
 
-	// Initialize database client
 	dbConnectionString := os.Getenv("DATABASE_URL")
 	if dbConnectionString == "" {
-		dbConnectionString = "postgres://postgres:postgres@localhost:5432/rinha?sslmode=disable"
+		dbConnectionString = "postgres://user:password@localhost/dbname?sslmode=disable"
 	}
 
 	dbClient, err := internal.NewPostgresDBClient(dbConnectionString)
@@ -248,6 +247,13 @@ func (s *Server) Start() error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.InfoContext(ctx, "Shutting down server gracefully")
 	s.handler.Shutdown()
+
+	if s.dbClient != nil {
+		err := s.dbClient.Close()
+		if err != nil {
+			s.logger.ErrorContext(ctx, "Failed to close database connection: "+err.Error())
+		}
+	}
 
 	err := s.server.Shutdown(ctx)
 	if err != nil {
@@ -327,82 +333,71 @@ func (s *Server) paymentsHandler(responseWriter http.ResponseWriter, request *ht
 	}
 }
 
-func (s *Server) dbHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
+func (s *Server) paymentsummaryHandler(responseWriter http.ResponseWriter, request *http.Request) {
+	ctx := request.Context()
+	s.logger.DebugContext(ctx, "Payments summary request received")
 
-	s.logger.Debug("Database summary request received")
+	if request.Method == http.MethodGet {
+		// Parse query parameters for time range
+		query := request.URL.Query()
 
-	// Parse query parameters for time range
-	fromStr := r.URL.Query().Get("from")
-	toStr := r.URL.Query().Get("to")
+		// Default to last 24 hours if not specified
+		endTime := time.Now().UTC()
+		startTime := endTime.Add(-24 * time.Hour)
 
-	if fromStr == "" || toStr == "" {
-		response := ErrorResponse{
-			Error:   "Missing query parameters",
-			Message: "Both 'from' and 'to' query parameters are required",
+		// Parse 'from' parameter if provided
+		if fromStr := query.Get("from"); fromStr != "" {
+			if parsedFrom, err := time.Parse(time.RFC3339, fromStr); err == nil {
+				startTime = parsedFrom.UTC()
+			} else {
+				s.logger.WarnContext(ctx, "Invalid 'from' parameter, using default: "+err.Error())
+			}
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(response)
-		return
-	}
-
-	// Parse time strings (simple format: 2006-01-02 15:04:05)
-	fromTime, err := time.Parse("2006-01-02 15:04:05", fromStr)
-	if err != nil {
-		response := ErrorResponse{
-			Error:   "Invalid time format",
-			Message: "Parameter 'from' must be in format: 2006-01-02 15:04:05 (e.g., 2020-07-10 12:34:56)",
+		// Parse 'to' parameter if provided
+		if toStr := query.Get("to"); toStr != "" {
+			if parsedTo, err := time.Parse(time.RFC3339, toStr); err == nil {
+				endTime = parsedTo.UTC()
+			} else {
+				s.logger.WarnContext(ctx, "Invalid 'to' parameter, using default: "+err.Error())
+			}
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(response)
-		return
-	}
+		summaries := s.dbClient.Read(startTime, endTime)
 
-	toTime, err := time.Parse("2006-01-02 15:04:05", toStr)
-	if err != nil {
-		response := ErrorResponse{
-			Error:   "Invalid time format",
-			Message: "Parameter 'to' must be in format: 2006-01-02 15:04:05 (e.g., 2020-07-10 12:35:56)",
+		response := map[string]interface{}{
+			"default": map[string]interface{}{
+				"totalRequests": summaries[0].TotalRequests,
+				"totalAmount":   summaries[0].TotalAmount,
+			},
+			"fallback": map[string]interface{}{
+				"totalRequests": summaries[1].TotalRequests,
+				"totalAmount":   summaries[1].TotalAmount,
+			},
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(response)
+		responseWriter.Header().Set("Content-Type", "application/json")
+		responseWriter.WriteHeader(http.StatusOK)
+
+		encodeErr := json.NewEncoder(responseWriter).Encode(response)
+		if encodeErr != nil {
+			s.logger.ErrorContext(ctx, "Failed to encode payments summary response: "+encodeErr.Error())
+		}
+
 		return
 	}
 
-	// Get summary data from database
-	summaries := s.dbClient.Read(fromTime, toTime)
-
-	// Create response in the expected format
-	response := map[string]interface{}{
-		"default": map[string]interface{}{
-			"totalRequests": summaries[internal.Default].TotalRequests,
-			"totalAmount":   summaries[internal.Default].TotalAmount,
-		},
-		"fallback": map[string]interface{}{
-			"totalRequests": summaries[internal.Fallback].TotalRequests,
-			"totalAmount":   summaries[internal.Fallback].TotalAmount,
-		},
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(response)
-
-	s.logger.Debug("Database summary response sent successfully")
+	// Method not allowed for non-GET requests
+	responseWriter.WriteHeader(http.StatusMethodNotAllowed)
 }
 
 func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/payments", s.paymentsHandler)
+<<<<<<< HEAD
 	s.mux.HandleFunc("/db", s.dbHandler)
+=======
+	s.mux.HandleFunc("/payments-summary", s.paymentsummaryHandler)
+>>>>>>> 9e30cce (feat: add PostgresDBClient integration with payment processing and summary endpoint)
 }
 
 func main() {
