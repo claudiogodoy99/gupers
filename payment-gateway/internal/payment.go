@@ -1,59 +1,107 @@
 package internal
 
 import (
-	"fmt"
+	"context"
+	"log/slog"
 	"time"
-
-	"go.uber.org/zap"
 )
 
+const (
+	tickerInterval = 100
+)
+
+// PaymentHandler manages payment processing with primary and fallback clients
+// using a fan-in/fan-out pattern for latency.
 type PaymentHandler struct {
 	paymentProcessorClient         PaymentClient
 	paymentProcessorFallbackClient PaymentClient
-	serverLogger                   *zap.SugaredLogger
+	logger                         *slog.Logger
+	pendingPaymentChan             chan *PaymentRequest
+	shutdown                       chan struct{}
 }
 
-func NewPaymentHandler(paymentProcessorClient, paymentProcessorFallbackClient PaymentClient, logger *zap.SugaredLogger) *PaymentHandler {
-	return &PaymentHandler{
+// NewPaymentHandler creates a new payment handler with the specified clients and worker configuration.
+// It starts the specified number of workers to process payments asynchronously.
+func NewPaymentHandler(
+	paymentProcessorClient, paymentProcessorFallbackClient PaymentClient,
+	chanLen, numWorkers int,
+	logger *slog.Logger,
+) *PaymentHandler {
+	payment := &PaymentHandler{
 		paymentProcessorClient:         paymentProcessorClient,
 		paymentProcessorFallbackClient: paymentProcessorFallbackClient,
-		serverLogger:                   logger,
+		logger:                         logger,
+		pendingPaymentChan:             make(chan *PaymentRequest, chanLen),
+		shutdown:                       make(chan struct{}),
 	}
+
+	for range numWorkers {
+		go payment.processPaymentAsync()
+	}
+
+	return payment
 }
 
+// PaymentRequest represents a payment processing request with amount, correlation ID, and timestamp.
 type PaymentRequest struct {
-	Amount        float64
-	CorrelationID string
-	RequestedAt   time.Time
+	Amount        float64   `json:"amount"`
+	CorrelationID string    `json:"correlationId"`
+	RequestedAt   time.Time `json:"requestedAt"`
 }
 
-// POC Logic
-func (p *PaymentHandler) ProcessPayment(logger zap.SugaredLogger, request *PaymentRequest) error {
-	primaryStatus := p.paymentProcessorClient.GetStatus()
-	if primaryStatus.available {
-		err := p.paymentProcessorClient.ProcessPayment(logger, request)
-		if err == nil {
+// ProcessPayment queues a payment request for asynchronous processing.
+// It returns an error if the system is shutting down.
+func (p *PaymentHandler) ProcessPayment(request *PaymentRequest) error {
+	ctx := context.Background()
+	p.logger.DebugContext(ctx, "received request, adding into channel",
+		slog.Int("channel_len", len(p.pendingPaymentChan)))
+
+	ticker := time.Tick(tickerInterval * time.Millisecond)
+
+	for {
+		select {
+		case p.pendingPaymentChan <- request:
+			return nil
+		case <-ticker:
+			p.logger.WarnContext(ctx, "taking too long to add request on channel",
+				slog.Int("channel_len", len(p.pendingPaymentChan)))
+		case <-p.shutdown:
 			return nil
 		}
-	} else {
-		logger.Warn("Primary payment processor unavailable, using fallback")
 	}
-
-	// Try fallback client
-	fallbackStatus := p.paymentProcessorFallbackClient.GetStatus()
-	if !fallbackStatus.available {
-		return fmt.Errorf("both primary and fallback payment processors are unavailable")
-	}
-
-	err := p.paymentProcessorFallbackClient.ProcessPayment(logger, request)
-	if err != nil {
-		return fmt.Errorf("fallback payment processor failed: %w", err)
-	}
-
-	return nil
 }
 
-func (c *PaymentHandler) Shutdown() {
-	c.paymentProcessorClient.Shutdown()
-	c.paymentProcessorFallbackClient.Shutdown()
+// Shutdown gracefully stops the payment handler and closes all connections.
+func (p *PaymentHandler) Shutdown() {
+	p.paymentProcessorClient.Shutdown()
+	p.paymentProcessorFallbackClient.Shutdown()
+
+	close(p.shutdown)
+}
+
+func (p *PaymentHandler) processPaymentAsync() {
+	ctx := context.Background()
+
+	for {
+		select {
+		case request := <-p.pendingPaymentChan:
+			client := p.selectBestClient()
+
+			err := client.ProcessPayment(request)
+			if err != nil {
+				p.logger.InfoContext(ctx, "error on pending request, trying to put on channel again")
+
+				go func() {
+					_ = p.ProcessPayment(request)
+				}()
+			}
+		case <-p.shutdown:
+			return
+		}
+	}
+}
+
+//nolint:ireturn // Interface return is intentional for polymorphism
+func (p *PaymentHandler) selectBestClient() PaymentClient {
+	return p.paymentProcessorClient
 }

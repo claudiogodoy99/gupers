@@ -101,6 +101,8 @@ services:
       - PRIMARY_PAYMENT_PROCESSOR_HEALTH_URL=http://payment-processor-default:8080/payments/service-health
       - FALLBACK_PAYMENT_PROCESSOR_URL=http://payment-processor-fallback:8080/payments
       - FALLBACK_PAYMENT_PROCESSOR_HEALTH_URL=http://payment-processor-fallback:8080/payments/service-health
+      - PAYMENT_CHANNEL_LEN=1000
+      - PAYMENT_NUM_WORKERS=20
     depends_on:
       - payment-processor-1
       - payment-processor-2
@@ -125,6 +127,8 @@ services:
       - PRIMARY_PAYMENT_PROCESSOR_HEALTH_URL=http://payment-processor-default:8080/payments/service-health
       - FALLBACK_PAYMENT_PROCESSOR_URL=http://payment-processor-fallback:8080/payments
       - FALLBACK_PAYMENT_PROCESSOR_HEALTH_URL=http://payment-processor-fallback:8080/payments/service-health
+      - PAYMENT_CHANNEL_LEN=1000
+      - PAYMENT_NUM_WORKERS=20
     depends_on:
       - payment-processor-1
       - payment-processor-2
