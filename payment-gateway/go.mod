@@ -12,6 +12,7 @@ require (
 
 require (
 	github.com/google/go-cmp v0.5.5 // indirect
+	github.com/lib/pq v1.10.9 // indirect
 	github.com/stretchr/testify v1.10.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 )

@@ -15,11 +15,12 @@ import (
 )
 
 type Server struct {
-	port    string
-	mux     *http.ServeMux
-	server  *http.Server
-	handler *internal.PaymentHandler
-	logger  *zap.Logger
+	port     string
+	mux      *http.ServeMux
+	server   *http.Server
+	handler  *internal.PaymentHandler
+	dbClient internal.DBClient
+	logger   *zap.Logger
 }
 
 type ErrorResponse struct {
@@ -89,6 +90,17 @@ func NewServer() *Server {
 	// Create payment handler with both clients
 	paymentHandler := internal.NewPaymentHandler(primaryPaymentClient, fallbackPaymentClient, logger.Sugar())
 
+	// Initialize database client
+	dbConnectionString := os.Getenv("DATABASE_URL")
+	if dbConnectionString == "" {
+		dbConnectionString = "postgres://postgres:postgres@localhost:5432/rinha?sslmode=disable"
+	}
+
+	dbClient, err := internal.NewPostgresDBClient(dbConnectionString)
+	if err != nil {
+		logger.Fatal("Failed to initialize database client", zap.Error(err))
+	}
+
 	server := &http.Server{
 		Addr:         ":" + port,
 		Handler:      mux,
@@ -98,11 +110,12 @@ func NewServer() *Server {
 	}
 
 	return &Server{
-		port:    port,
-		mux:     mux,
-		server:  server,
-		handler: paymentHandler,
-		logger:  logger,
+		port:     port,
+		mux:      mux,
+		server:   server,
+		handler:  paymentHandler,
+		dbClient: dbClient,
+		logger:   logger,
 	}
 }
 
@@ -135,6 +148,12 @@ func (s *Server) paymentsHandler(w http.ResponseWriter, r *http.Request) {
 	}).Sugar()
 
 	scopedLogger.Infof("processing payment: %s", paymentRequest)
+
+	// Set the requested time if not provided
+	if paymentRequest.RequestedAt.IsZero() {
+		paymentRequest.RequestedAt = time.Now()
+	}
+
 	err := s.handler.ProcessPayment(*scopedLogger, &paymentRequest)
 	if err != nil {
 		scopedLogger.Errorf("Failed to process payment: %v", err)
@@ -150,6 +169,13 @@ func (s *Server) paymentsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Save payment to database after successful processing
+	if err := s.dbClient.Write(paymentRequest); err != nil {
+		scopedLogger.Errorf("Failed to save payment to database: %v", err)
+	} else {
+		scopedLogger.Debug("Payment saved to database successfully")
+	}
+
 	scopedLogger.Debug("Payment processed successfully")
 
 	response := map[string]string{"status": "processed"}
@@ -158,8 +184,82 @@ func (s *Server) paymentsHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+func (s *Server) dbHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.logger.Debug("Database summary request received")
+
+	// Parse query parameters for time range
+	fromStr := r.URL.Query().Get("from")
+	toStr := r.URL.Query().Get("to")
+
+	if fromStr == "" || toStr == "" {
+		response := ErrorResponse{
+			Error:   "Missing query parameters",
+			Message: "Both 'from' and 'to' query parameters are required",
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	// Parse time strings (simple format: 2006-01-02 15:04:05)
+	fromTime, err := time.Parse("2006-01-02 15:04:05", fromStr)
+	if err != nil {
+		response := ErrorResponse{
+			Error:   "Invalid time format",
+			Message: "Parameter 'from' must be in format: 2006-01-02 15:04:05 (e.g., 2020-07-10 12:34:56)",
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	toTime, err := time.Parse("2006-01-02 15:04:05", toStr)
+	if err != nil {
+		response := ErrorResponse{
+			Error:   "Invalid time format",
+			Message: "Parameter 'to' must be in format: 2006-01-02 15:04:05 (e.g., 2020-07-10 12:35:56)",
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	// Get summary data from database
+	summaries := s.dbClient.Read(fromTime, toTime)
+
+	// Create response in the expected format
+	response := map[string]interface{}{
+		"default": map[string]interface{}{
+			"totalRequests": summaries[internal.Default].TotalRequests,
+			"totalAmount":   summaries[internal.Default].TotalAmount,
+		},
+		"fallback": map[string]interface{}{
+			"totalRequests": summaries[internal.Fallback].TotalRequests,
+			"totalAmount":   summaries[internal.Fallback].TotalAmount,
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+
+	s.logger.Debug("Database summary response sent successfully")
+}
+
 func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/payments", s.paymentsHandler)
+	s.mux.HandleFunc("/db", s.dbHandler)
 }
 
 func (s *Server) Start() error {
@@ -177,6 +277,11 @@ func (s *Server) Start() error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.Info("Shutting down server gracefully")
 	s.handler.Shutdown()
+
+	// Close database connection
+	if err := s.dbClient.Close(); err != nil {
+		s.logger.Error("Failed to close database connection", zap.Error(err))
+	}
 
 	// Shutdown the HTTP server with context
 	if err := s.server.Shutdown(ctx); err != nil {
