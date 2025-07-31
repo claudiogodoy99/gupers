@@ -1,4 +1,20 @@
 x-service-templates:
+  payment-gateway-db: &payment-gateway-db
+    image: postgres:17-alpine
+    networks:
+      - payment-gateway-db
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    environment:
+      - POSTGRES_PASSWORD=gateway
+      - POSTGRES_USER=gateway
+      - POSTGRES_DB=gateway
+    deploy:
+      resources:
+        limits:
+          cpus: "0.4"
+          memory: "120MB"
+          
   payment-processor: &payment-processor
     image: zanfranceschi/payment-processor:amd64-20250707101540
     networks:
@@ -68,6 +84,12 @@ services:
     container_name: payment-processor-fallback-db
     hostname: payment-processor-fallback-db
 
+  # Payment Gateway Database
+  payment-gateway-db:
+    <<: *payment-gateway-db
+    container_name: payment-gateway-db
+    hostname: payment-gateway-db
+
   # Load Balancer (Envoy)
   envoy:
     image: envoyproxy/envoy:v1.28-latest
@@ -97,6 +119,7 @@ services:
     hostname: payment-gateway-1
     environment:
       - PORT=8080
+      - DATABASE_URL=postgres://gateway:gateway@payment-gateway-db:5432/gateway?sslmode=disable
       - PRIMARY_PAYMENT_PROCESSOR_URL=http://payment-processor-default:8080/payments
       - PRIMARY_PAYMENT_PROCESSOR_HEALTH_URL=http://payment-processor-default:8080/payments/service-health
       - FALLBACK_PAYMENT_PROCESSOR_URL=http://payment-processor-fallback:8080/payments
@@ -104,9 +127,11 @@ services:
       - PAYMENT_CHANNEL_LEN=1000
       - PAYMENT_NUM_WORKERS=20
     depends_on:
+      - payment-gateway-db
       - payment-processor-1
       - payment-processor-2
     networks:
+      - payment-gateway-db
       - payment-processor
     deploy:
       resources:
@@ -123,6 +148,7 @@ services:
     hostname: payment-gateway-2
     environment:
       - PORT=8080
+      - DATABASE_URL=postgres://gateway:gateway@payment-gateway-db:5432/gateway?sslmode=disable
       - PRIMARY_PAYMENT_PROCESSOR_URL=http://payment-processor-default:8080/payments
       - PRIMARY_PAYMENT_PROCESSOR_HEALTH_URL=http://payment-processor-default:8080/payments/service-health
       - FALLBACK_PAYMENT_PROCESSOR_URL=http://payment-processor-fallback:8080/payments
@@ -130,9 +156,11 @@ services:
       - PAYMENT_CHANNEL_LEN=1000
       - PAYMENT_NUM_WORKERS=20
     depends_on:
+      - payment-gateway-db
       - payment-processor-1
       - payment-processor-2
     networks:
+      - payment-gateway-db
       - payment-processor
     deploy:
       resources:
