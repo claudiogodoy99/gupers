@@ -13,6 +13,8 @@ linters:
             - '!$test'
           allow:
             - $gostd
+            - github.com/govalues/decimal
+            - github.com/claudiogodoy/gupers/payment-gateway/internal
         test:
           files:
             - $test

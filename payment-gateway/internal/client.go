@@ -11,27 +11,15 @@ import (
 	"net/http"
 	"sync"
 	"time"
-
-	"github.com/HdrHistogram/hdrhistogram-go"
 )
 
 const (
 	// healthCheckInterval defines how often health checks are performed.
 	healthCheckInterval = 5
-	// histogramPrecision defines the precision level for histogram measurements.
-	histogramPrecision = 3
 )
 
 // ErrPaymentProcessorStatus indicates the payment processor returned an error status.
 var ErrPaymentProcessorStatus = errors.New("payment processor returned error status")
-
-// PaymentClient defines the interface for payment processing clients that handle
-// payment requests, health monitoring, and graceful shutdown.
-type PaymentClient interface {
-	ProcessPayment(request *PaymentRequest) error
-	GetStatus() PaymentClientState
-	Shutdown()
-}
 
 // ServicesAvailabilityWireResponse represents the response structure from
 // health check endpoints indicating service availability and response times.
@@ -40,7 +28,8 @@ type ServicesAvailabilityWireResponse struct {
 	MinResponseTime int  `json:"minResponseTime"`
 }
 
-type paymentClient struct {
+// PaymentClient is a client for the payment gateway.
+type PaymentClient struct {
 	httpClient   *http.Client
 	state        PaymentClientState
 	shutdown     chan struct{}
@@ -54,20 +43,15 @@ type paymentClient struct {
 // PaymentClientState holds the current state of a payment client including
 // availability status and performance metrics.
 type PaymentClientState struct {
-	histogram *hdrhistogram.Histogram
 	available bool
 }
 
 // NewPaymentClient creates a new payment client with health monitoring capabilities.
-// It returns a PaymentClient interface for dependency injection and testability.
-//
-//nolint:ireturn // Interface return is intentional for polymorphism
-func NewPaymentClient(httpClient *http.Client, url, healthCheckURL string, logger *slog.Logger) PaymentClient {
-	client := &paymentClient{
+func NewPaymentClient(httpClient *http.Client, url, healthCheckURL string, logger *slog.Logger) *PaymentClient {
+	client := &PaymentClient{
 		httpClient: httpClient,
 		state: PaymentClientState{
 			available: true,
-			histogram: hdrhistogram.New(1, time.Minute.Microseconds(), histogramPrecision),
 		},
 		shutdown:       make(chan struct{}),
 		url:            url,
@@ -81,22 +65,20 @@ func NewPaymentClient(httpClient *http.Client, url, healthCheckURL string, logge
 }
 
 // ProcessPayment sends a payment request to the payment processor.
-func (c *paymentClient) ProcessPayment(request *PaymentRequest) error {
+func (c *PaymentClient) ProcessPayment(request *PaymentRequest) error {
 	ctx := context.Background()
-	since := time.Now()
 
 	var err error
 
 	defer func() {
-		timeTaken := time.Since(since)
-		c.update(err == nil, timeTaken)
+		c.update(err == nil)
 	}()
 
 	request.RequestedAt = time.Now()
 
 	jsonData, err := json.Marshal(request)
 	if err != nil {
-		c.serverLogger.ErrorContext(ctx, "failed to marshal request: "+err.Error())
+		c.serverLogger.ErrorContext(ctx, fmt.Sprintf("failed to marshal request: %v", err))
 
 		return fmt.Errorf("failed to marshal payment request: %w", err)
 	}
@@ -110,7 +92,7 @@ func (c *paymentClient) ProcessPayment(request *PaymentRequest) error {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		c.serverLogger.ErrorContext(ctx, "failed to send payment request: "+err.Error())
+		c.serverLogger.ErrorContext(ctx, fmt.Sprintf("failed to send payment request: %v", err))
 
 		return fmt.Errorf("failed to send payment request: %w", err)
 	}
@@ -118,7 +100,7 @@ func (c *paymentClient) ProcessPayment(request *PaymentRequest) error {
 	defer func() {
 		closeErr := resp.Body.Close()
 		if closeErr != nil {
-			c.serverLogger.ErrorContext(ctx, "failed to close response body: "+closeErr.Error())
+			c.serverLogger.ErrorContext(ctx, fmt.Sprintf("failed to close response body: %v", closeErr))
 		}
 	}()
 
@@ -130,7 +112,7 @@ func (c *paymentClient) ProcessPayment(request *PaymentRequest) error {
 }
 
 // GetStatus returns the current state of the payment client.
-func (c *paymentClient) GetStatus() PaymentClientState {
+func (c *PaymentClient) GetStatus() PaymentClientState {
 	c.mu.RLock()
 	localCopy := c.state
 	c.mu.RUnlock()
@@ -139,11 +121,11 @@ func (c *paymentClient) GetStatus() PaymentClientState {
 }
 
 // Shutdown gracefully stops the payment client monitoring.
-func (c *paymentClient) Shutdown() {
+func (c *PaymentClient) Shutdown() {
 	close(c.shutdown)
 }
 
-func (c *paymentClient) monitorClient() {
+func (c *PaymentClient) monitorClient() {
 	ticker := time.NewTicker(healthCheckInterval * time.Second)
 	defer ticker.Stop()
 
@@ -157,30 +139,21 @@ func (c *paymentClient) monitorClient() {
 	}
 }
 
-func (c *paymentClient) update(available bool, timeTaken time.Duration) {
+func (c *PaymentClient) update(available bool) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	c.state.available = available
-	if timeTaken > 0 {
-		err := c.state.histogram.RecordValue(timeTaken.Microseconds())
-		if err != nil {
-			// Log error but don't fail the update operation
-			ctx := context.Background()
-			c.serverLogger.ErrorContext(ctx, "failed to record histogram value: "+err.Error())
-		}
-	}
-
-	c.mu.Unlock()
 }
 
-func (c *paymentClient) performHealthCheck() {
+func (c *PaymentClient) performHealthCheck() {
 	ctx := context.Background()
 	c.serverLogger.DebugContext(ctx, "health checking endpoint: "+c.healthCheckURL)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.healthCheckURL, nil)
 	if err != nil {
-		c.serverLogger.ErrorContext(ctx, "failed to create health check request: "+err.Error())
-		c.update(false, -1)
+		c.serverLogger.ErrorContext(ctx, fmt.Sprintf("failed to create health check request: %v", err))
+		c.update(false)
 
 		return
 	}
@@ -188,7 +161,7 @@ func (c *paymentClient) performHealthCheck() {
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		c.serverLogger.ErrorContext(ctx, "endpoint "+c.healthCheckURL+" unavailable")
-		c.update(false, -1)
+		c.update(false)
 
 		return
 	}
@@ -196,13 +169,13 @@ func (c *paymentClient) performHealthCheck() {
 	defer func() {
 		closeErr := resp.Body.Close()
 		if closeErr != nil {
-			c.serverLogger.ErrorContext(ctx, "failed to close response body: "+closeErr.Error())
+			c.serverLogger.ErrorContext(ctx, fmt.Sprintf("failed to close response body: %v", closeErr))
 		}
 	}()
 
 	if resp.StatusCode != http.StatusOK {
 		c.serverLogger.ErrorContext(ctx, "endpoint "+c.healthCheckURL+" unavailable")
-		c.update(false, -1)
+		c.update(false)
 
 		return
 	}
@@ -211,22 +184,17 @@ func (c *paymentClient) performHealthCheck() {
 
 	err = json.NewDecoder(resp.Body).Decode(&healthResp)
 	if err != nil {
-		c.update(false, -1)
+		c.update(false)
 
 		return
 	}
 
 	available := !healthResp.Failing
 
-	var duration time.Duration
-	if healthResp.MinResponseTime > 0 {
-		duration = time.Duration(healthResp.MinResponseTime) * time.Millisecond
-	}
-
 	c.serverLogger.DebugContext(ctx, "health-check completed",
 		slog.String("endpoint", c.healthCheckURL),
 		slog.Bool("available", available),
 		slog.Int("response_time_ms", healthResp.MinResponseTime))
 
-	c.update(available, duration)
+	c.update(available)
 }

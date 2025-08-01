@@ -55,8 +55,8 @@ type httpClients struct {
 }
 
 type paymentClients struct {
-	primary  internal.PaymentClient
-	fallback internal.PaymentClient
+	primary  *internal.PaymentClient
+	fallback *internal.PaymentClient
 }
 
 type workerConfiguration struct {
@@ -235,7 +235,7 @@ func (s *Server) paymentsHandler(responseWriter http.ResponseWriter, request *ht
 
 	err := json.NewDecoder(request.Body).Decode(&paymentRequest)
 	if err != nil {
-		s.logger.ErrorContext(ctx, "error on decode json: "+err.Error())
+		s.logger.ErrorContext(ctx, fmt.Sprintf("error on decode json: %v", err))
 
 		response := ErrorResponse{
 			Error:   "Invalid request body",
@@ -247,15 +247,15 @@ func (s *Server) paymentsHandler(responseWriter http.ResponseWriter, request *ht
 
 		encodeErr := json.NewEncoder(responseWriter).Encode(response)
 		if encodeErr != nil {
-			s.logger.ErrorContext(ctx, "Failed to encode error response: "+encodeErr.Error())
+			s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to encode error response: %v", encodeErr))
 		}
 
 		return
 	}
 
-	err = s.handler.ProcessPayment(&paymentRequest)
+	err = s.handler.ProcessPayment(ctx, &paymentRequest)
 	if err != nil {
-		s.logger.ErrorContext(ctx, "Failed to process payment: "+err.Error())
+		s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to process payment: %v", err))
 
 		response := ErrorResponse{
 			Error:   "Failed to process payment",
@@ -267,7 +267,7 @@ func (s *Server) paymentsHandler(responseWriter http.ResponseWriter, request *ht
 
 		encodeErr := json.NewEncoder(responseWriter).Encode(response)
 		if encodeErr != nil {
-			s.logger.ErrorContext(ctx, "Failed to encode error response: "+encodeErr.Error())
+			s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to encode error response: %v", encodeErr))
 		}
 
 		return
@@ -282,7 +282,7 @@ func (s *Server) paymentsHandler(responseWriter http.ResponseWriter, request *ht
 
 	encodeErr := json.NewEncoder(responseWriter).Encode(response)
 	if encodeErr != nil {
-		s.logger.ErrorContext(ctx, "Failed to encode success response: "+encodeErr.Error())
+		s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to encode success response: %v", encodeErr))
 	}
 }
 
@@ -315,7 +315,7 @@ func main() {
 
 	err := server.Shutdown(ctx)
 	if err != nil {
-		server.logger.ErrorContext(ctx, "Error during shutdown: "+err.Error())
+		server.logger.ErrorContext(ctx, fmt.Sprintf("Error during shutdown: %v", err))
 	}
 
 	<-ctx.Done()

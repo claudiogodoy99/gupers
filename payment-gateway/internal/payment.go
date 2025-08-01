@@ -13,8 +13,8 @@ const (
 // PaymentHandler manages payment processing with primary and fallback clients
 // using a fan-in/fan-out pattern for latency.
 type PaymentHandler struct {
-	paymentProcessorClient         PaymentClient
-	paymentProcessorFallbackClient PaymentClient
+	paymentProcessorClient         *PaymentClient
+	paymentProcessorFallbackClient *PaymentClient
 	logger                         *slog.Logger
 	pendingPaymentChan             chan *PaymentRequest
 	shutdown                       chan struct{}
@@ -23,7 +23,7 @@ type PaymentHandler struct {
 // NewPaymentHandler creates a new payment handler with the specified clients and worker configuration.
 // It starts the specified number of workers to process payments asynchronously.
 func NewPaymentHandler(
-	paymentProcessorClient, paymentProcessorFallbackClient PaymentClient,
+	paymentProcessorClient, paymentProcessorFallbackClient *PaymentClient,
 	chanLen, numWorkers int,
 	logger *slog.Logger,
 ) *PaymentHandler {
@@ -51,8 +51,7 @@ type PaymentRequest struct {
 
 // ProcessPayment queues a payment request for asynchronous processing.
 // It returns an error if the system is shutting down.
-func (p *PaymentHandler) ProcessPayment(request *PaymentRequest) error {
-	ctx := context.Background()
+func (p *PaymentHandler) ProcessPayment(ctx context.Context, request *PaymentRequest) error {
 	p.logger.DebugContext(ctx, "received request, adding into channel",
 		slog.Int("channel_len", len(p.pendingPaymentChan)))
 
@@ -92,7 +91,7 @@ func (p *PaymentHandler) processPaymentAsync() {
 				p.logger.InfoContext(ctx, "error on pending request, trying to put on channel again")
 
 				go func() {
-					_ = p.ProcessPayment(request)
+					_ = p.ProcessPayment(ctx, request)
 				}()
 			}
 		case <-p.shutdown:
@@ -101,7 +100,6 @@ func (p *PaymentHandler) processPaymentAsync() {
 	}
 }
 
-//nolint:ireturn // Interface return is intentional for polymorphism
-func (p *PaymentHandler) selectBestClient() PaymentClient {
+func (p *PaymentHandler) selectBestClient() *PaymentClient {
 	return p.paymentProcessorClient
 }
