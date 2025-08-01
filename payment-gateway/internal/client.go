@@ -28,7 +28,7 @@ type ServicesAvailabilityWireResponse struct {
 	MinResponseTime int  `json:"minResponseTime"`
 }
 
-// PaymentClient is a cliente for the payment gateway.
+// PaymentClient is a client for the payment gateway.
 type PaymentClient struct {
 	httpClient   *http.Client
 	state        PaymentClientState
