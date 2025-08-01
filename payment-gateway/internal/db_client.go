@@ -6,24 +6,19 @@ import (
 	"github.com/govalues/decimal"
 )
 
+// DBClient is the interface to interact with the database for payment requests.
 type DBClient interface {
-	write(PaymentRequest) error
+	write(request PaymentRequest) error
 	read(init, end time.Time) [2]Summary
 }
 
+// Summary represents the summary of payment requests and amounts.
 type Summary struct {
 	TotalRequests int
 	TotalAmount   decimal.Decimal
 }
 
-type ProcessorType int
-
-const (
-	Default ProcessorType = iota
-	Fallback
-)
-
-//expects
+// expects
 // read: HTTP 200 - Ok
 // {
 //     "default" : {
