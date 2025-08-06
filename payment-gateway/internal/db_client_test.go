@@ -9,6 +9,7 @@ import (
 	"github.com/govalues/decimal"
 )
 
+// nolint: cyclop
 func TestPostgresDBClient(t *testing.T) {
 	// Skip test if no database URL is provided
 	dbURL := os.Getenv("TEST_DATABASE_URL")
@@ -78,13 +79,13 @@ func TestPostgresDBClient(t *testing.T) {
 		}
 
 		// Fallback should be zero
-		// if summaries[Fallback].TotalRequests != 0 {
-		// 	t.Error("Expected zero requests in fallback summary")
-		// }
+		if summaries[Fallback].TotalRequests != 0 {
+			t.Error("Expected zero requests in fallback summary")
+		}
 
-		// if !summaries[Fallback].TotalAmount.IsZero() {
-		// 	t.Error("Expected zero amount in fallback summary")
-		// }
+		if !summaries[Fallback].TotalAmount.IsZero() {
+			t.Error("Expected zero amount in fallback summary")
+		}
 
 		t.Logf("Default Summary - Requests: %d, Amount: %s",
 			summaries[Default].TotalRequests,
