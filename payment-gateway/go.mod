@@ -13,3 +13,4 @@ require (
 	github.com/google/go-cmp v0.5.5 // indirect
 	github.com/stretchr/testify v1.10.0 // indirect
 )
+require github.com/govalues/decimal v0.1.36

@@ -9,12 +9,14 @@ import (
 	_ "github.com/lib/pq"
 )
 
+// DBClient is the interface to interact with the database for payment requests.
 type DBClient interface {
 	Write(PaymentRequest) error
 	Read(init, end time.Time) [2]Summary
 	Close() error
 }
 
+// Summary represents the summary of payment requests and amounts.
 type Summary struct {
 	TotalRequests int
 	TotalAmount   decimal.Decimal
