@@ -13,26 +13,25 @@ const (
 // PaymentHandler manages payment processing with primary and fallback clients
 // using a fan-in/fan-out pattern for latency.
 type PaymentHandler struct {
-	paymentProcessorClient         *PaymentClient
-	paymentProcessorFallbackClient *PaymentClient
-	logger                         *slog.Logger
-	pendingPaymentChan             chan *PaymentRequest
-	shutdown                       chan struct{}
+	logger             *slog.Logger
+	pendingPaymentChan chan *PaymentRequest
+	router             Router
+	shutdownChan       chan struct{}
 }
 
 // NewPaymentHandler creates a new payment handler with the specified clients and worker configuration.
 // It starts the specified number of workers to process payments asynchronously.
 func NewPaymentHandler(
-	paymentProcessorClient, paymentProcessorFallbackClient *PaymentClient,
-	chanLen, numWorkers int,
+	router *Router,
+	numWorkers int,
+	pendingPaymentChan chan *PaymentRequest,
 	logger *slog.Logger,
 ) *PaymentHandler {
 	payment := &PaymentHandler{
-		paymentProcessorClient:         paymentProcessorClient,
-		paymentProcessorFallbackClient: paymentProcessorFallbackClient,
-		logger:                         logger,
-		pendingPaymentChan:             make(chan *PaymentRequest, chanLen),
-		shutdown:                       make(chan struct{}),
+		router:             *router,
+		logger:             logger,
+		pendingPaymentChan: pendingPaymentChan,
+		shutdownChan:       make(chan struct{}),
 	}
 
 	for range numWorkers {
@@ -49,8 +48,7 @@ type PaymentRequest struct {
 	RequestedAt   time.Time `json:"requestedAt"`
 }
 
-// ProcessPayment queues a payment request for asynchronous processing.
-// It returns an error if the system is shutting down.
+// ProcessPayment adds a payment request to the pending channel for processing.
 func (p *PaymentHandler) ProcessPayment(ctx context.Context, request *PaymentRequest) error {
 	p.logger.DebugContext(ctx, "received request, adding into channel",
 		slog.Int("channel_len", len(p.pendingPaymentChan)))
@@ -64,18 +62,17 @@ func (p *PaymentHandler) ProcessPayment(ctx context.Context, request *PaymentReq
 		case <-ticker:
 			p.logger.WarnContext(ctx, "taking too long to add request on channel",
 				slog.Int("channel_len", len(p.pendingPaymentChan)))
-		case <-p.shutdown:
+		case <-p.shutdownChan:
 			return nil
 		}
 	}
 }
 
-// Shutdown gracefully stops the payment handler and closes all connections.
+// Shutdown gracefully shuts down the PaymentHandler and its associated router.
 func (p *PaymentHandler) Shutdown() {
-	p.paymentProcessorClient.Shutdown()
-	p.paymentProcessorFallbackClient.Shutdown()
+	p.router.Shutdown()
 
-	close(p.shutdown)
+	close(p.shutdownChan)
 }
 
 func (p *PaymentHandler) processPaymentAsync() {
@@ -84,9 +81,9 @@ func (p *PaymentHandler) processPaymentAsync() {
 	for {
 		select {
 		case request := <-p.pendingPaymentChan:
-			client := p.selectBestClient()
+			client := p.router.route()
 
-			err := client.ProcessPayment(request)
+			err := client.processPayment(request)
 			if err != nil {
 				p.logger.InfoContext(ctx, "error on pending request, trying to put on channel again")
 
@@ -94,12 +91,8 @@ func (p *PaymentHandler) processPaymentAsync() {
 					_ = p.ProcessPayment(ctx, request)
 				}()
 			}
-		case <-p.shutdown:
+		case <-p.shutdownChan:
 			return
 		}
 	}
-}
-
-func (p *PaymentHandler) selectBestClient() *PaymentClient {
-	return p.paymentProcessorClient
 }

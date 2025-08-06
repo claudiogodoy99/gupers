@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"net/http"
 	"os"
@@ -25,8 +26,9 @@ const (
 	serverIdleTimeout  = 60
 	shutdownTimeout    = 30
 
-	defaultChannelLen = 10
-	defaultNumWorkers = 10
+	defaultChannelLen = 1000
+	defaultNumWorkers = 28
+	defaultThreshold  = 70
 )
 
 type Server struct {
@@ -47,6 +49,7 @@ type configuration struct {
 	primaryHealthURL  string
 	fallbackURL       string
 	fallbackHealthURL string
+	routerThreshold   int
 }
 
 type httpClients struct {
@@ -85,11 +88,24 @@ func loadConfiguration() configuration {
 		panic("FALLBACK_PAYMENT_PROCESSOR_HEALTH_URL not set")
 	}
 
+	// Load router threshold from environment variable
+	routerThreshold := defaultThreshold
+
+	if thresholdStr := os.Getenv("ROUTER_THRESHOLD"); thresholdStr != "" {
+		val, err := strconv.Atoi(thresholdStr)
+		if err == nil {
+			routerThreshold = val
+		} else {
+			log.Printf("Invalid ROUTER_THRESHOLD, using default: %v", err)
+		}
+	}
+
 	return configuration{
 		primaryURL:        primaryURL,
 		primaryHealthURL:  primaryHealthURL,
 		fallbackURL:       fallbackURL,
 		fallbackHealthURL: fallbackHealthURL,
+		routerThreshold:   routerThreshold,
 	}
 }
 
@@ -172,9 +188,14 @@ func NewServer() *Server {
 		slog.Int("num_workers", workerConfig.numWorkers),
 	)
 
-	// Create payment handler with both clients
-	paymentHandler := internal.NewPaymentHandler(paymentClients.primary,
-		paymentClients.fallback, workerConfig.channelLen, workerConfig.numWorkers, logger)
+	channel := make(chan *internal.PaymentRequest, workerConfig.channelLen)
+	router := internal.NewRouter(config.routerThreshold,
+		workerConfig.channelLen,
+		channel,
+		paymentClients.primary,
+		paymentClients.fallback)
+
+	paymentHandler := internal.NewPaymentHandler(router, workerConfig.numWorkers, channel, logger)
 
 	server := &http.Server{
 		Addr:         ":" + port,

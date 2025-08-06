@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -31,28 +31,20 @@ type ServicesAvailabilityWireResponse struct {
 // PaymentClient is a client for the payment gateway.
 type PaymentClient struct {
 	httpClient   *http.Client
-	state        PaymentClientState
+	count        atomic.Int64
+	health       atomic.Bool
 	shutdown     chan struct{}
 	serverLogger *slog.Logger
 
-	mu             sync.RWMutex
 	url            string
 	healthCheckURL string
 }
 
-// PaymentClientState holds the current state of a payment client including
-// availability status and performance metrics.
-type PaymentClientState struct {
-	available bool
-}
-
-// NewPaymentClient creates a new payment client with health monitoring capabilities.
+// NewPaymentClient creates a new PaymentClient instance for interacting with the payment gateway.
 func NewPaymentClient(httpClient *http.Client, url, healthCheckURL string, logger *slog.Logger) *PaymentClient {
 	client := &PaymentClient{
 		httpClient: httpClient,
-		state: PaymentClientState{
-			available: true,
-		},
+
 		shutdown:       make(chan struct{}),
 		url:            url,
 		healthCheckURL: healthCheckURL,
@@ -64,8 +56,14 @@ func NewPaymentClient(httpClient *http.Client, url, healthCheckURL string, logge
 	return client
 }
 
-// ProcessPayment sends a payment request to the payment processor.
-func (c *PaymentClient) ProcessPayment(request *PaymentRequest) error {
+// Shutdown gracefully stops the payment client monitoring.
+func (c *PaymentClient) Shutdown() {
+	close(c.shutdown)
+}
+
+func (c *PaymentClient) processPayment(request *PaymentRequest) error {
+	c.count.Add(1)
+
 	ctx := context.Background()
 
 	var err error
@@ -111,20 +109,6 @@ func (c *PaymentClient) ProcessPayment(request *PaymentRequest) error {
 	return nil
 }
 
-// GetStatus returns the current state of the payment client.
-func (c *PaymentClient) GetStatus() PaymentClientState {
-	c.mu.RLock()
-	localCopy := c.state
-	c.mu.RUnlock()
-
-	return localCopy
-}
-
-// Shutdown gracefully stops the payment client monitoring.
-func (c *PaymentClient) Shutdown() {
-	close(c.shutdown)
-}
-
 func (c *PaymentClient) monitorClient() {
 	ticker := time.NewTicker(healthCheckInterval * time.Second)
 	defer ticker.Stop()
@@ -140,10 +124,7 @@ func (c *PaymentClient) monitorClient() {
 }
 
 func (c *PaymentClient) update(available bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.state.available = available
+	c.health.Store(available)
 }
 
 func (c *PaymentClient) performHealthCheck() {
@@ -175,7 +156,6 @@ func (c *PaymentClient) performHealthCheck() {
 
 	if resp.StatusCode != http.StatusOK {
 		c.serverLogger.ErrorContext(ctx, "endpoint "+c.healthCheckURL+" unavailable")
-		c.update(false)
 
 		return
 	}
@@ -184,8 +164,6 @@ func (c *PaymentClient) performHealthCheck() {
 
 	err = json.NewDecoder(resp.Body).Decode(&healthResp)
 	if err != nil {
-		c.update(false)
-
 		return
 	}
 
