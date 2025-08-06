@@ -43,8 +43,7 @@ type PaymentClient struct {
 // NewPaymentClient creates a new PaymentClient instance for interacting with the payment gateway.
 func NewPaymentClient(httpClient *http.Client, url, healthCheckURL string, logger *slog.Logger) *PaymentClient {
 	client := &PaymentClient{
-		httpClient: httpClient,
-
+		httpClient:     httpClient,
 		shutdown:       make(chan struct{}),
 		url:            url,
 		healthCheckURL: healthCheckURL,

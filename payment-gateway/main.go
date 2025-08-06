@@ -32,12 +32,11 @@ const (
 )
 
 type Server struct {
-	port     string
-	mux      *http.ServeMux
-	server   *http.Server
-	handler  *internal.PaymentHandler
-	dbClient internal.DBClient
-	logger   *slog.Logger
+	port    string
+	mux     *http.ServeMux
+	server  *http.Server
+	handler *internal.PaymentHandler
+	logger  *slog.Logger
 }
 
 type ErrorResponse struct {
@@ -217,12 +216,11 @@ func NewServer() *Server {
 	}
 
 	return &Server{
-		port:     port,
-		mux:      mux,
-		server:   server,
-		handler:  paymentHandler,
-		dbClient: dbClient,
-		logger:   logger,
+		port:    port,
+		mux:     mux,
+		server:  server,
+		handler: paymentHandler,
+		logger:  logger,
 	}
 }
 
@@ -247,13 +245,6 @@ func (s *Server) Start() error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.InfoContext(ctx, "Shutting down server gracefully")
 	s.handler.Shutdown()
-
-	if s.dbClient != nil {
-		err := s.dbClient.Close()
-		if err != nil {
-			s.logger.ErrorContext(ctx, "Failed to close database connection: "+err.Error())
-		}
-	}
 
 	err := s.server.Shutdown(ctx)
 	if err != nil {
@@ -333,71 +324,10 @@ func (s *Server) paymentsHandler(responseWriter http.ResponseWriter, request *ht
 	}
 }
 
-func (s *Server) paymentsummaryHandler(responseWriter http.ResponseWriter, request *http.Request) {
-	ctx := request.Context()
-	s.logger.DebugContext(ctx, "Payments summary request received")
-
-	if request.Method == http.MethodGet {
-		// Parse query parameters for time range
-		query := request.URL.Query()
-
-		// Default to last 24 hours if not specified
-		endTime := time.Now().UTC()
-		startTime := endTime.Add(-24 * time.Hour)
-
-		// Parse 'from' parameter if provided
-		if fromStr := query.Get("from"); fromStr != "" {
-			if parsedFrom, err := time.Parse(time.RFC3339, fromStr); err == nil {
-				startTime = parsedFrom.UTC()
-			} else {
-				s.logger.WarnContext(ctx, "Invalid 'from' parameter, using default: "+err.Error())
-			}
-		}
-
-		// Parse 'to' parameter if provided
-		if toStr := query.Get("to"); toStr != "" {
-			if parsedTo, err := time.Parse(time.RFC3339, toStr); err == nil {
-				endTime = parsedTo.UTC()
-			} else {
-				s.logger.WarnContext(ctx, "Invalid 'to' parameter, using default: "+err.Error())
-			}
-		}
-
-		summaries := s.dbClient.Read(startTime, endTime)
-
-		response := map[string]interface{}{
-			"default": map[string]interface{}{
-				"totalRequests": summaries[0].TotalRequests,
-				"totalAmount":   summaries[0].TotalAmount,
-			},
-			"fallback": map[string]interface{}{
-				"totalRequests": summaries[1].TotalRequests,
-				"totalAmount":   summaries[1].TotalAmount,
-			},
-		}
-
-		responseWriter.Header().Set("Content-Type", "application/json")
-		responseWriter.WriteHeader(http.StatusOK)
-
-		encodeErr := json.NewEncoder(responseWriter).Encode(response)
-		if encodeErr != nil {
-			s.logger.ErrorContext(ctx, "Failed to encode payments summary response: "+encodeErr.Error())
-		}
-
-		return
-	}
-
-	// Method not allowed for non-GET requests
-	responseWriter.WriteHeader(http.StatusMethodNotAllowed)
-}
-
 func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/payments", s.paymentsHandler)
-<<<<<<< HEAD
 	s.mux.HandleFunc("/db", s.dbHandler)
-=======
 	s.mux.HandleFunc("/payments-summary", s.paymentsummaryHandler)
->>>>>>> 9e30cce (feat: add PostgresDBClient integration with payment processing and summary endpoint)
 }
 
 func main() {

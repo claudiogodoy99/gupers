@@ -13,9 +13,8 @@ const (
 // PaymentHandler manages payment processing with primary and fallback clients
 // using a fan-in/fan-out pattern for latency.
 type PaymentHandler struct {
-	paymentProcessorClient         PaymentClient
-	paymentProcessorFallbackClient PaymentClient
-	dbClient                       DBClient
+	paymentProcessorClient         *PaymentClient
+	paymentProcessorFallbackClient *PaymentClient
 	logger                         *slog.Logger
 	pendingPaymentChan             chan *PaymentRequest
 	shutdown                       chan struct{}
@@ -24,15 +23,13 @@ type PaymentHandler struct {
 // NewPaymentHandler creates a new payment handler with the specified clients and worker configuration.
 // It starts the specified number of workers to process payments asynchronously.
 func NewPaymentHandler(
-	paymentProcessorClient, paymentProcessorFallbackClient PaymentClient,
-	dbClient DBClient,
+	paymentProcessorClient, paymentProcessorFallbackClient *PaymentClient,
 	chanLen, numWorkers int,
 	logger *slog.Logger,
 ) *PaymentHandler {
 	payment := &PaymentHandler{
 		paymentProcessorClient:         paymentProcessorClient,
 		paymentProcessorFallbackClient: paymentProcessorFallbackClient,
-		dbClient:                       dbClient,
 		logger:                         logger,
 		pendingPaymentChan:             make(chan *PaymentRequest, chanLen),
 		shutdown:                       make(chan struct{}),
@@ -94,22 +91,6 @@ func (p *PaymentHandler) processPaymentAsync() {
 				go func() {
 					_ = p.ProcessPayment(ctx, request)
 				}()
-			} else {
-				// Save to database after successful payment processing
-				if p.dbClient != nil {
-					dbErr := p.dbClient.Write(*request)
-					if dbErr != nil {
-						p.logger.ErrorContext(ctx, "Failed to save payment to database",
-							slog.String("correlation_id", request.CorrelationID),
-							slog.String("error", dbErr.Error()))
-					} else {
-						p.logger.DebugContext(ctx, "Payment saved to database successfully",
-							slog.String("correlation_id", request.CorrelationID))
-					}
-				} else {
-					p.logger.WarnContext(ctx, "Database client is nil, payment not saved to database",
-						slog.String("correlation_id", request.CorrelationID))
-				}
 			}
 		case <-p.shutdownChan:
 			return
