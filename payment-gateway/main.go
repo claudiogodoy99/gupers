@@ -30,12 +30,11 @@ const (
 )
 
 type Server struct {
-	port     string
-	mux      *http.ServeMux
-	server   *http.Server
-	handler  *internal.PaymentHandler
-	dbClient internal.DBClient
-	logger   *slog.Logger
+	port    string
+	mux     *http.ServeMux
+	server  *http.Server
+	handler *internal.PaymentHandler
+	logger  *slog.Logger
 }
 
 type ErrorResponse struct {
@@ -56,8 +55,8 @@ type httpClients struct {
 }
 
 type paymentClients struct {
-	primary  internal.PaymentClient
-	fallback internal.PaymentClient
+	primary  *internal.PaymentClient
+	fallback *internal.PaymentClient
 }
 
 type workerConfiguration struct {
@@ -173,21 +172,9 @@ func NewServer() *Server {
 		slog.Int("num_workers", workerConfig.numWorkers),
 	)
 
-	// Create database client
-	dbConnectionString := os.Getenv("DATABASE_URL")
-	if dbConnectionString == "" {
-		dbConnectionString = "postgres://user:password@localhost/dbname?sslmode=disable"
-	}
-
-	dbClient, err := internal.NewPostgresDBClient(dbConnectionString)
-	if err != nil {
-		logger.ErrorContext(ctx, "Failed to create database client: "+err.Error())
-		dbClient = nil // Set to nil so we can handle this gracefully
-	}
-
-	// Create payment handler with both clients and database client
+	// Create payment handler with both clients
 	paymentHandler := internal.NewPaymentHandler(paymentClients.primary,
-		paymentClients.fallback, dbClient, workerConfig.channelLen, workerConfig.numWorkers, logger)
+		paymentClients.fallback, workerConfig.channelLen, workerConfig.numWorkers, logger)
 
 	server := &http.Server{
 		Addr:         ":" + port,
@@ -198,12 +185,11 @@ func NewServer() *Server {
 	}
 
 	return &Server{
-		port:     port,
-		mux:      mux,
-		server:   server,
-		handler:  paymentHandler,
-		dbClient: dbClient,
-		logger:   logger,
+		port:    port,
+		mux:     mux,
+		server:  server,
+		handler: paymentHandler,
+		logger:  logger,
 	}
 }
 
@@ -229,13 +215,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.InfoContext(ctx, "Shutting down server gracefully")
 	s.handler.Shutdown()
 
-	if s.dbClient != nil {
-		err := s.dbClient.Close()
-		if err != nil {
-			s.logger.ErrorContext(ctx, "Failed to close database connection: "+err.Error())
-		}
-	}
-
 	err := s.server.Shutdown(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to shutdown server: %w", err)
@@ -256,7 +235,7 @@ func (s *Server) paymentsHandler(responseWriter http.ResponseWriter, request *ht
 
 	err := json.NewDecoder(request.Body).Decode(&paymentRequest)
 	if err != nil {
-		s.logger.ErrorContext(ctx, "error on decode json: "+err.Error())
+		s.logger.ErrorContext(ctx, fmt.Sprintf("error on decode json: %v", err))
 
 		response := ErrorResponse{
 			Error:   "Invalid request body",
@@ -268,15 +247,15 @@ func (s *Server) paymentsHandler(responseWriter http.ResponseWriter, request *ht
 
 		encodeErr := json.NewEncoder(responseWriter).Encode(response)
 		if encodeErr != nil {
-			s.logger.ErrorContext(ctx, "Failed to encode error response: "+encodeErr.Error())
+			s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to encode error response: %v", encodeErr))
 		}
 
 		return
 	}
 
-	err = s.handler.ProcessPayment(&paymentRequest)
+	err = s.handler.ProcessPayment(ctx, &paymentRequest)
 	if err != nil {
-		s.logger.ErrorContext(ctx, "Failed to process payment: "+err.Error())
+		s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to process payment: %v", err))
 
 		response := ErrorResponse{
 			Error:   "Failed to process payment",
@@ -288,7 +267,7 @@ func (s *Server) paymentsHandler(responseWriter http.ResponseWriter, request *ht
 
 		encodeErr := json.NewEncoder(responseWriter).Encode(response)
 		if encodeErr != nil {
-			s.logger.ErrorContext(ctx, "Failed to encode error response: "+encodeErr.Error())
+			s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to encode error response: %v", encodeErr))
 		}
 
 		return
@@ -303,71 +282,12 @@ func (s *Server) paymentsHandler(responseWriter http.ResponseWriter, request *ht
 
 	encodeErr := json.NewEncoder(responseWriter).Encode(response)
 	if encodeErr != nil {
-		s.logger.ErrorContext(ctx, "Failed to encode success response: "+encodeErr.Error())
+		s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to encode success response: %v", encodeErr))
 	}
-}
-
-func (s *Server) paymentsummaryHandler(responseWriter http.ResponseWriter, request *http.Request) {
-	ctx := request.Context()
-	s.logger.DebugContext(ctx, "Payments summary request received")
-
-	if request.Method == http.MethodGet {
-		// Parse query parameters for time range
-		query := request.URL.Query()
-
-		// Default to last 24 hours if not specified
-		endTime := time.Now().UTC()
-		startTime := endTime.Add(-24 * time.Hour)
-
-		// Parse 'from' parameter if provided
-		if fromStr := query.Get("from"); fromStr != "" {
-			if parsedFrom, err := time.Parse(time.RFC3339, fromStr); err == nil {
-				startTime = parsedFrom.UTC()
-			} else {
-				s.logger.WarnContext(ctx, "Invalid 'from' parameter, using default: "+err.Error())
-			}
-		}
-
-		// Parse 'to' parameter if provided
-		if toStr := query.Get("to"); toStr != "" {
-			if parsedTo, err := time.Parse(time.RFC3339, toStr); err == nil {
-				endTime = parsedTo.UTC()
-			} else {
-				s.logger.WarnContext(ctx, "Invalid 'to' parameter, using default: "+err.Error())
-			}
-		}
-
-		summaries := s.dbClient.Read(startTime, endTime)
-
-		response := map[string]interface{}{
-			"default": map[string]interface{}{
-				"totalRequests": summaries[0].TotalRequests,
-				"totalAmount":   summaries[0].TotalAmount,
-			},
-			"fallback": map[string]interface{}{
-				"totalRequests": summaries[1].TotalRequests,
-				"totalAmount":   summaries[1].TotalAmount,
-			},
-		}
-
-		responseWriter.Header().Set("Content-Type", "application/json")
-		responseWriter.WriteHeader(http.StatusOK)
-
-		encodeErr := json.NewEncoder(responseWriter).Encode(response)
-		if encodeErr != nil {
-			s.logger.ErrorContext(ctx, "Failed to encode payments summary response: "+encodeErr.Error())
-		}
-
-		return
-	}
-
-	// Method not allowed for non-GET requests
-	responseWriter.WriteHeader(http.StatusMethodNotAllowed)
 }
 
 func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/payments", s.paymentsHandler)
-	s.mux.HandleFunc("/payments-summary", s.paymentsummaryHandler)
 }
 
 func main() {
@@ -395,7 +315,7 @@ func main() {
 
 	err := server.Shutdown(ctx)
 	if err != nil {
-		server.logger.ErrorContext(ctx, "Error during shutdown: "+err.Error())
+		server.logger.ErrorContext(ctx, fmt.Sprintf("Error during shutdown: %v", err))
 	}
 
 	<-ctx.Done()
