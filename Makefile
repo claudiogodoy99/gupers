@@ -1,4 +1,4 @@
-.PHONY: build run run-dev test test-local clean docker-build docker-run up down dc-build
+.PHONY: build run run-dev test test-local clean docker-build docker-run up down dc-build post-payment get-summary test-endpoints
 
 # Variables
 BINARY_NAME=server
@@ -48,9 +48,22 @@ post-payment:
 	@echo "Making POST request to http://localhost:9999/payments"
 	@curl -X POST http://localhost:9999/payments \
 		-H "Content-Type: application/json" \
-		-d '{"CorrelationId": "$(shell uuidgen)", "Amount": 100.50}' \
+		-d '{"correlationId": "$(shell uuidgen)", "amount": 100.50}' \
 		-w "\nHTTP Status: %{http_code}\nResponse Time: %{time_total}s\n" \
-		-s || echo "Error: Make sure the services are running with 'make docker-up'"
+		-s || echo "Error: Make sure the services are running with 'make up'"
+
+# Test payments summary endpoint
+get-summary:
+	@echo "Testing payments summary endpoint via Envoy load balancer..."
+	@echo "Making GET request to http://localhost:9999/payments-summary"
+	@curl -X GET http://localhost:9999/payments-summary \
+		-H "Accept: application/json" \
+		-w "\nHTTP Status: %{http_code}\nResponse Time: %{time_total}s\n" \
+		-s || echo "Error: Make sure the services are running with 'make up'"
+
+# Test both endpoints in sequence
+test-endpoints: post-payment get-summary
+	@echo "Testing complete! Both endpoints tested."
 
 # Build Docker image
 docker-build:
@@ -86,7 +99,9 @@ help:
 	@echo "  run          - Run the application with production settings"
 	@echo "  run-dev      - Run the application with development settings"
 	@echo "  test         - Run unit tests"
-	@echo "  post-payment   - Test payment endpoint via Envoy load balancer (requires services running)"
+	@echo "  post-payment - Test payment endpoint via Envoy load balancer (requires services running)"
+	@echo "  get-summary  - Test payments summary endpoint via Envoy load balancer (requires services running)"
+	@echo "  test-endpoints - Test both payment and summary endpoints (requires services running)"
 	@echo "  docker-build - Build Docker image"
 	@echo "  docker-run   - Build and run Docker container"
 	@echo "  dc-build    - build all services with Docker Compose"
@@ -102,6 +117,8 @@ help:
 	@echo "  FALLBACK_PAYMENT_PROCESSOR_HEALTH_URL   - Fallback payment processor health check URL"
 	@echo ""
 	@echo "Quick Start:"
-	@echo "  make up    # Start all services"
-	@echo "  make post-payment   # Test the payment endpoint"
-	@echo "  make down  # Stop services"
+	@echo "  make up           # Start all services"
+	@echo "  make post-payment # Test the payment endpoint"
+	@echo "  make get-summary  # Test the payments summary endpoint"
+	@echo "  make test-endpoints # Test both endpoints"
+	@echo "  make down         # Stop services"

@@ -11,8 +11,8 @@ import (
 
 // DBClient is the interface to interact with the database for payment requests.
 type DBClient interface {
-	Write(PaymentRequest) error
-	Read(init, end time.Time) [2]Summary
+	Write(request PaymentRequest) error
+	Read(init, end time.Time) ([2]Summary, error)
 	Close() error
 }
 
@@ -22,17 +22,22 @@ type Summary struct {
 	TotalAmount   decimal.Decimal
 }
 
+// ProcessorType represents the type of payment processor (default or fallback).
 type ProcessorType int
 
 const (
+	// Default represents the primary payment processor.
 	Default ProcessorType = iota
+	// Fallback represents the fallback payment processor.
 	Fallback
 )
 
+// PostgresDBClient implements the DBClient interface using PostgreSQL as the database.
 type PostgresDBClient struct {
 	db *sql.DB
 }
 
+// NewPostgresDBClient creates a new PostgreSQL database client with connection pooling and retry logic.
 func NewPostgresDBClient(connectionString string) (*PostgresDBClient, error) {
 	// Open a new database connection
 	db, err := sql.Open("postgres", connectionString)
@@ -45,12 +50,23 @@ func NewPostgresDBClient(connectionString string) (*PostgresDBClient, error) {
 	db.SetMaxIdleConns(20)                 // Maximum number of idle connections
 	db.SetConnMaxLifetime(5 * time.Minute) // Maximum lifetime of a connection in the pool
 
-	// ping the database to ensure connection is established
-	if err := db.Ping(); err != nil {
-		return nil, fmt.Errorf("failed to ping database: %w", err)
+	// Retry database connection with exponential backoff
+	maxRetries := 10
+	baseDelay := 1 * time.Second
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if err := db.Ping(); err == nil {
+			break // Successfully connected
+		}
+
+		if attempt == maxRetries {
+			return nil, fmt.Errorf("failed to ping database after %d attempts: %w", maxRetries, err)
+		}
+
+		// Exponential backoff delay
+		delay := time.Duration(attempt) * baseDelay
+		time.Sleep(delay)
 	}
 
-	// Create the payments table if it does not exist
 	return &PostgresDBClient{db: db}, nil
 }
 
@@ -82,6 +98,7 @@ func (p *PostgresDBClient) Read(init, end time.Time) ([2]Summary, error) {
         WHERE requested_at >= $1 AND requested_at <= $2`
 
 	var totalRequests int
+
 	var totalAmountFloat float64
 
 	// Execute the query and scan the results into totalRequests and totalAmountFloat

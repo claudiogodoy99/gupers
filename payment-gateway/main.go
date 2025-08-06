@@ -150,6 +150,18 @@ func NewServer() *Server {
 		port = "8080"
 	}
 
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		panic("DATABASE_URL not set")
+	}
+
+	dbClient, err := internal.NewPostgresDBClient(dbURL)
+	if err != nil {
+		logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+		logger.ErrorContext(ctx, "Failed to create database client",
+			slog.String("error", err.Error()))
+	}
+
 	config := loadConfiguration()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -174,7 +186,7 @@ func NewServer() *Server {
 
 	// Create payment handler with both clients
 	paymentHandler := internal.NewPaymentHandler(paymentClients.primary,
-		paymentClients.fallback, workerConfig.channelLen, workerConfig.numWorkers, logger)
+		paymentClients.fallback, workerConfig.channelLen, workerConfig.numWorkers, logger, dbClient)
 
 	server := &http.Server{
 		Addr:         ":" + port,
@@ -253,6 +265,10 @@ func (s *Server) paymentsHandler(responseWriter http.ResponseWriter, request *ht
 		return
 	}
 
+	if paymentRequest.RequestedAt.IsZero() {
+		paymentRequest.RequestedAt = time.Now().UTC()
+	}
+
 	err = s.handler.ProcessPayment(ctx, &paymentRequest)
 	if err != nil {
 		s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to process payment: %v", err))
@@ -288,6 +304,78 @@ func (s *Server) paymentsHandler(responseWriter http.ResponseWriter, request *ht
 
 func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/payments", s.paymentsHandler)
+	s.mux.HandleFunc("/payments-summary", s.paymentsSummaryHandler)
+}
+
+func (s *Server) paymentsSummaryHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse query parameters
+	fromStr := r.URL.Query().Get("from")
+	toStr := r.URL.Query().Get("to")
+
+	var from, to time.Time
+	var err error
+
+	if fromStr != "" {
+		from, err = time.Parse(time.RFC3339, fromStr)
+		if err != nil {
+			http.Error(w, "Invalid from parameter", http.StatusBadRequest)
+			return
+		}
+	} else {
+		from = time.Time{} // Zero time
+	}
+
+	if toStr != "" {
+		to, err = time.Parse(time.RFC3339, toStr)
+		if err != nil {
+			http.Error(w, "Invalid to parameter", http.StatusBadRequest)
+			return
+		}
+	} else {
+		to = time.Now()
+	}
+
+	// Get summaries from database
+	summaries, err := s.handler.GetPaymentsSummary(from, to)
+	if err != nil {
+		s.logger.ErrorContext(r.Context(), "Failed to read payments summary",
+			slog.String("error", err.Error()))
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Format response
+	defaultAmount, defaultOk := summaries[0].TotalAmount.Float64()
+	if !defaultOk {
+		s.logger.ErrorContext(r.Context(), "Failed to convert default amount to float64")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	fallbackAmount, fallbackOk := summaries[1].TotalAmount.Float64()
+	if !fallbackOk {
+		s.logger.ErrorContext(r.Context(), "Failed to convert fallback amount to float64")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	response := map[string]interface{}{
+		"default": map[string]interface{}{
+			"totalRequests": summaries[0].TotalRequests,
+			"totalAmount":   defaultAmount,
+		},
+		"fallback": map[string]interface{}{
+			"totalRequests": summaries[1].TotalRequests,
+			"totalAmount":   fallbackAmount,
+		},
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 func main() {
