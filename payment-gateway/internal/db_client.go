@@ -68,7 +68,7 @@ func (p *PostgresDBClient) Write(request PaymentRequest) error {
 	return nil
 }
 
-func (p *PostgresDBClient) Read(init, end time.Time) [2]Summary {
+func (p *PostgresDBClient) Read(init, end time.Time) ([2]Summary, error) {
 	var summaries [2]Summary
 
 	// Query to get the total requests and amount for the given time range
@@ -85,13 +85,13 @@ func (p *PostgresDBClient) Read(init, end time.Time) [2]Summary {
 	// Execute the query and scan the results into totalRequests and totalAmountFloat
 	err := p.db.QueryRow(query, init, end).Scan(&totalRequests, &totalAmountFloat)
 	if err != nil && err != sql.ErrNoRows {
-		return summaries
+		return summaries, fmt.Errorf("failed to query payments: %w", err)
 	}
 
 	// Convert totalAmountFloat to decimal.Decimal
 	totalAmount, err := decimal.NewFromFloat64(totalAmountFloat)
 	if err != nil {
-		return summaries
+		return summaries, fmt.Errorf("failed to convert amount to decimal: %w", err)
 	}
 
 	summaries[Default] = Summary{
@@ -104,7 +104,7 @@ func (p *PostgresDBClient) Read(init, end time.Time) [2]Summary {
 		TotalAmount:   decimal.Zero,
 	}
 
-	return summaries
+	return summaries, nil
 }
 
 func (p *PostgresDBClient) Close() error {
