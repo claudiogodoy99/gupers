@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 )
@@ -18,6 +19,7 @@ type PaymentHandler struct {
 	logger                         *slog.Logger
 	pendingPaymentChan             chan *PaymentRequest
 	shutdown                       chan struct{}
+	dbClient                       DBClient
 }
 
 // NewPaymentHandler creates a new payment handler with the specified clients and worker configuration.
@@ -26,6 +28,7 @@ func NewPaymentHandler(
 	paymentProcessorClient, paymentProcessorFallbackClient *PaymentClient,
 	chanLen, numWorkers int,
 	logger *slog.Logger,
+	dbClient DBClient,
 ) *PaymentHandler {
 	payment := &PaymentHandler{
 		paymentProcessorClient:         paymentProcessorClient,
@@ -33,6 +36,7 @@ func NewPaymentHandler(
 		logger:                         logger,
 		pendingPaymentChan:             make(chan *PaymentRequest, chanLen),
 		shutdown:                       make(chan struct{}),
+		dbClient:                       dbClient,
 	}
 
 	for range numWorkers {
@@ -84,16 +88,49 @@ func (p *PaymentHandler) processPaymentAsync() {
 		case request := <-p.pendingPaymentChan:
 			client := p.router.route()
 
-			err := client.processPayment(request)
-			if err != nil {
-				p.logger.InfoContext(ctx, "error on pending request, trying to put on channel again")
+			p.logger.InfoContext(ctx, "Processing payment",
+				slog.String("correlationId", request.CorrelationID),
+				slog.Float64("amount", request.Amount))
 
-				go func() {
-					_ = p.ProcessPayment(ctx, request)
-				}()
+			err := client.ProcessPayment(request)
+
+			if err == nil {
+				if p.dbClient != nil {
+					if dbErr := p.dbClient.Write(*request); dbErr != nil {
+						p.logger.ErrorContext(ctx, "failed to write payment request to database",
+							slog.String("correlationId", request.CorrelationID),
+							slog.String("error", dbErr.Error()))
+					} else {
+						p.logger.InfoContext(ctx, "Payment saved to database successfully",
+							slog.String("correlationId", request.CorrelationID))
+					}
+				} else {
+					p.logger.WarnContext(ctx, "Database client not available, payment not persisted",
+						slog.String("correlationId", request.CorrelationID))
+				}
+			}
+
+			if err != nil {
+				p.logger.ErrorContext(ctx, "Payment processor failed",
+					slog.String("correlationId", request.CorrelationID),
+					slog.String("error", err.Error()))
+			} else {
+				p.logger.InfoContext(ctx, "Payment processor succeeded",
+					slog.String("correlationId", request.CorrelationID))
 			}
 		case <-p.shutdownChan:
 			return
 		}
 	}
+}
+
+func (p *PaymentHandler) selectBestClient() *PaymentClient {
+	return p.paymentProcessorClient
+}
+
+func (p *PaymentHandler) GetPaymentsSummary(from, to time.Time) ([2]Summary, error) {
+	if p.dbClient == nil {
+		return [2]Summary{}, fmt.Errorf("database client not available")
+	}
+	return p.dbClient.Read(from, to)
 }

@@ -3,13 +3,6 @@ module github.com/claudiogodoy/gupers/payment-gateway
 go 1.24.5
 
 require (
-	github.com/google/uuid v1.6.0
 	github.com/govalues/decimal v0.1.36
 	github.com/lib/pq v1.10.9
-)
-
-require (
-	github.com/google/go-cmp v0.5.5 // indirect
-	github.com/stretchr/testify v1.10.0 // indirect
-	go.uber.org/multierr v1.11.0 // indirect
 )
