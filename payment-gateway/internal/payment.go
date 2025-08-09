@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -11,36 +12,38 @@ const (
 	tickerInterval = 100
 )
 
+// ErrDBClientUnavailable is returned when a database client hasn't been configured.
+var ErrDBClientUnavailable = errors.New("database client not available")
+
 // PaymentHandler manages payment processing with primary and fallback clients
 // using a fan-in/fan-out pattern for latency.
 type PaymentHandler struct {
-	paymentProcessorClient         *PaymentClient
-	paymentProcessorFallbackClient *PaymentClient
-	logger                         *slog.Logger
-	pendingPaymentChan             chan *PaymentRequest
-	shutdown                       chan struct{}
-	dbClient                       DBClient
+	router             *Router
+	logger             *slog.Logger
+	pendingPaymentChan chan *PaymentRequest
+	shutdown           chan struct{}
+	dbClient           DBClient
 }
 
 // NewPaymentHandler creates a new payment handler with the specified clients and worker configuration.
 // It starts the specified number of workers to process payments asynchronously.
 func NewPaymentHandler(
-	paymentProcessorClient, paymentProcessorFallbackClient *PaymentClient,
-	chanLen, numWorkers int,
+	router *Router,
+	numWorkers int,
+	pendingChan chan *PaymentRequest,
 	logger *slog.Logger,
 	dbClient DBClient,
 ) *PaymentHandler {
 	payment := &PaymentHandler{
-		paymentProcessorClient:         paymentProcessorClient,
-		paymentProcessorFallbackClient: paymentProcessorFallbackClient,
-		logger:                         logger,
-		pendingPaymentChan:             make(chan *PaymentRequest, chanLen),
-		shutdown:                       make(chan struct{}),
-		dbClient:                       dbClient,
+		router:             router,
+		logger:             logger,
+		pendingPaymentChan: pendingChan,
+		shutdown:           make(chan struct{}),
+		dbClient:           dbClient,
 	}
 
-	for range numWorkers {
-		go payment.processPaymentAsync()
+	for range numWorkers { // start worker goroutines (Go 1.22 integer range)
+		go payment.processPaymentWorker()
 	}
 
 	return payment
@@ -58,79 +61,109 @@ func (p *PaymentHandler) ProcessPayment(ctx context.Context, request *PaymentReq
 	p.logger.DebugContext(ctx, "received request, adding into channel",
 		slog.Int("channel_len", len(p.pendingPaymentChan)))
 
-	ticker := time.Tick(tickerInterval * time.Millisecond)
+	ticker := time.NewTicker(tickerInterval * time.Millisecond)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case p.pendingPaymentChan <- request:
 			return nil
-		case <-ticker:
+		case <-ticker.C:
 			p.logger.WarnContext(ctx, "taking too long to add request on channel",
 				slog.Int("channel_len", len(p.pendingPaymentChan)))
-		case <-p.shutdownChan:
+		case <-p.shutdown:
 			return nil
 		}
 	}
+}
+
+// GetPaymentsSummary returns payment summaries for the provided time window.
+func (p *PaymentHandler) GetPaymentsSummary(from, to time.Time) ([2]Summary, error) {
+	if p.dbClient == nil {
+		return [2]Summary{}, ErrDBClientUnavailable
+	}
+
+	summaries, err := p.dbClient.Read(from, to)
+	if err != nil {
+		return [2]Summary{}, fmt.Errorf("read payments summary: %w", err)
+	}
+
+	return summaries, nil
 }
 
 // Shutdown gracefully shuts down the PaymentHandler and its associated router.
 func (p *PaymentHandler) Shutdown() {
 	p.router.Shutdown()
 
-	close(p.shutdownChan)
+	close(p.shutdown)
 }
 
-func (p *PaymentHandler) processPaymentAsync() {
+func (p *PaymentHandler) processPaymentWorker() {
 	ctx := context.Background()
 
 	for {
 		select {
 		case request := <-p.pendingPaymentChan:
-			client := p.router.route()
+			routeClientAndSendRequest := func() error {
+				client := p.router.route()
 
-			p.logger.InfoContext(ctx, "Processing payment",
-				slog.String("correlationId", request.CorrelationID),
-				slog.Float64("amount", request.Amount))
-
-			err := client.ProcessPayment(request)
-
-			if err == nil {
-				if p.dbClient != nil {
-					if dbErr := p.dbClient.Write(*request); dbErr != nil {
-						p.logger.ErrorContext(ctx, "failed to write payment request to database",
-							slog.String("correlationId", request.CorrelationID),
-							slog.String("error", dbErr.Error()))
-					} else {
-						p.logger.InfoContext(ctx, "Payment saved to database successfully",
-							slog.String("correlationId", request.CorrelationID))
-					}
-				} else {
-					p.logger.WarnContext(ctx, "Database client not available, payment not persisted",
-						slog.String("correlationId", request.CorrelationID))
-				}
-			}
-
-			if err != nil {
-				p.logger.ErrorContext(ctx, "Payment processor failed",
+				p.logger.InfoContext(ctx, "Processing payment",
 					slog.String("correlationId", request.CorrelationID),
-					slog.String("error", err.Error()))
-			} else {
-				p.logger.InfoContext(ctx, "Payment processor succeeded",
-					slog.String("correlationId", request.CorrelationID))
+					slog.Float64("amount", request.Amount))
+
+				return client.processPayment(ctx, request)
 			}
-		case <-p.shutdownChan:
+			persistRequestInDatabase := func() error {
+				return p.sendToDB(ctx, request)
+			}
+
+			// We must retry until the both func's are successfully done
+			retryEngine(routeClientAndSendRequest)
+			retryEngine(persistRequestInDatabase)
+
+			p.logger.InfoContext(ctx, "Payment processor succeeded",
+				slog.String("correlationId", request.CorrelationID))
+		case <-p.shutdown:
 			return
 		}
 	}
 }
 
-func (p *PaymentHandler) selectBestClient() *PaymentClient {
-	return p.paymentProcessorClient
+func (p *PaymentHandler) sendToDB(ctx context.Context, request *PaymentRequest) error {
+	err := p.dbClient.Write(*request)
+	if err == nil {
+		return nil
+	}
+
+	p.logger.ErrorContext(ctx, "failed to write payment request to database",
+		slog.String("correlationId", request.CorrelationID),
+		slog.String("error", err.Error()))
+
+	return fmt.Errorf("write payment request: %w", err)
 }
 
-func (p *PaymentHandler) GetPaymentsSummary(from, to time.Time) ([2]Summary, error) {
-	if p.dbClient == nil {
-		return [2]Summary{}, fmt.Errorf("database client not available")
+func retryEngine(action func() error) {
+	const (
+		initialBackoff   = 500 * time.Millisecond
+		maxBackoff       = 2 * time.Second
+		incrementBackoff = 500 * time.Millisecond
+	)
+
+	backoff := initialBackoff
+
+	for {
+		err := action()
+		if err == nil {
+			return
+		}
+
+		time.Sleep(backoff)
+
+		if backoff < maxBackoff {
+			backoff += incrementBackoff
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
 	}
-	return p.dbClient.Read(from, to)
 }

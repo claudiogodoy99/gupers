@@ -1,5 +1,7 @@
 // Package main implements a payment gateway service that provides high availability
 // payment processing with primary and fallback payment processors.
+//
+//nolint:depguard
 package main
 
 import (
@@ -17,6 +19,7 @@ import (
 	"time"
 
 	"github.com/claudiogodoy/gupers/payment-gateway/internal"
+	_ "github.com/lib/pq"
 )
 
 const (
@@ -158,66 +161,18 @@ func loadWorkerConfiguration(ctx context.Context, logger *slog.Logger) workerCon
 	}
 }
 
-func NewServer() *Server {
+func NewServer() *Server { // function length acceptable due to setup logic
 	ctx := context.Background()
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		panic("DATABASE_URL not set")
-	}
-
-	dbClient, err := internal.NewPostgresDBClient(dbURL)
-	if err != nil {
-		logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-		logger.ErrorContext(ctx, "Failed to create database client",
-			slog.String("error", err.Error()))
-	}
-
+	port := getEnvDefault("PORT", "8080")
+	dbURL := mustGetEnv("DATABASE_URL")
+	logger := newLogger()
+	dbClient := initDBClient(ctx, logger, dbURL)
 	config := loadConfiguration()
-
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-
-	logger.InfoContext(ctx, "Payment processor configuration ",
-		slog.String("primary_url", config.primaryURL),
-		slog.String("primary_health_url", config.primaryHealthURL),
-		slog.String("fallback_url", config.fallbackURL),
-		slog.String("fallback_health_url", config.fallbackHealthURL),
-	)
+	logConfiguration(ctx, logger, config)
 
 	mux := http.NewServeMux()
-
-	clients := createHTTPClients()
-	paymentClients := createPaymentClients(clients, config, logger)
-	workerConfig := loadWorkerConfiguration(ctx, logger)
-
-	logger.InfoContext(ctx, "Payment handler configuration",
-		slog.Int("channel_len", workerConfig.channelLen),
-		slog.Int("num_workers", workerConfig.numWorkers),
-	)
-
-	channel := make(chan *internal.PaymentRequest, workerConfig.channelLen)
-	router := internal.NewRouter(config.routerThreshold,
-		workerConfig.channelLen,
-		channel,
-		paymentClients.primary,
-		paymentClients.fallback)
-
-	paymentHandler := internal.NewPaymentHandler(router, workerConfig.numWorkers, channel, logger)
-
-	dbConnectionString := os.Getenv("DATABASE_URL")
-	if dbConnectionString == "" {
-		dbConnectionString = "postgres://user:password@localhost/dbname?sslmode=disable"
-	}
-
-	dbClient, err := internal.NewPostgresDBClient(dbConnectionString)
-	if err != nil {
-		panic(fmt.Sprintf("Failed to initialize database client %w", err))
-	}
+	paymentHandler := buildPaymentHandler(ctx, config, logger, dbClient)
 
 	server := &http.Server{
 		Addr:         ":" + port,
@@ -227,13 +182,72 @@ func NewServer() *Server {
 		IdleTimeout:  serverIdleTimeout * time.Second,
 	}
 
-	return &Server{
-		port:    port,
-		mux:     mux,
-		server:  server,
-		handler: paymentHandler,
-		logger:  logger,
+	return &Server{port: port, mux: mux, server: server, handler: paymentHandler, logger: logger}
+}
+
+func newLogger() *slog.Logger { return slog.New(slog.NewTextHandler(os.Stdout, nil)) }
+
+func getEnvDefault(key, def string) string {
+	val := os.Getenv(key)
+	if val != "" {
+		return val
 	}
+
+	return def
+}
+
+func mustGetEnv(key string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		panic(key + " not set")
+	}
+	return v
+}
+
+func initDBClient(ctx context.Context, logger *slog.Logger, dbURL string) *internal.PostgresDBClient { // concrete type to satisfy ireturn
+	dbClient, err := internal.NewPostgresDBClient(dbURL)
+	if err != nil {
+		logger.ErrorContext(ctx, "Failed to create database client", slog.String("error", err.Error()))
+		panic(fmt.Sprintf("failed to initialize database client: %v", err))
+	}
+
+	return dbClient
+}
+
+func logConfiguration(ctx context.Context, logger *slog.Logger, cfg configuration) {
+	logger.InfoContext(ctx, "Payment processor configuration",
+		slog.String("primary_url", cfg.primaryURL),
+		slog.String("primary_health_url", cfg.primaryHealthURL),
+		slog.String("fallback_url", cfg.fallbackURL),
+		slog.String("fallback_health_url", cfg.fallbackHealthURL),
+	)
+}
+
+func buildPaymentHandler(
+	ctx context.Context,
+	cfg configuration,
+	logger *slog.Logger,
+	dbClient internal.DBClient,
+) *internal.PaymentHandler {
+	clients := createHTTPClients()
+	paymentClients := createPaymentClients(clients, cfg, logger)
+	workerConf := loadWorkerConfiguration(ctx, logger)
+
+	logger.InfoContext(ctx, "Payment handler configuration",
+		slog.Int("channel_len", workerConf.channelLen),
+		slog.Int("num_workers", workerConf.numWorkers),
+	)
+
+	channel := make(chan *internal.PaymentRequest, workerConf.channelLen)
+	router := internal.NewRouter(
+		cfg.routerThreshold,
+		workerConf.channelLen,
+		channel,
+		paymentClients.primary,
+		paymentClients.fallback,
+	)
+
+	return internal.NewPaymentHandler(router, workerConf.numWorkers, channel, logger, dbClient)
 }
 
 func (s *Server) Start() error {
@@ -266,71 +280,33 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) paymentsHandler(responseWriter http.ResponseWriter, request *http.Request) {
+func (s *Server) paymentsHandler(writer http.ResponseWriter, request *http.Request) { // route handler
 	if request.Method != http.MethodPost {
+		http.Error(writer, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 		return
 	}
 
 	ctx := request.Context()
 	s.logger.DebugContext(ctx, "Payment request received")
 
-	var paymentRequest internal.PaymentRequest
-
-	err := json.NewDecoder(request.Body).Decode(&paymentRequest)
-	if err != nil {
-		s.logger.ErrorContext(ctx, fmt.Sprintf("error on decode json: %v", err))
-
-		response := ErrorResponse{
-			Error:   "Invalid request body",
-			Message: "Failed to decode JSON request",
-		}
-
-		responseWriter.Header().Set("Content-Type", "application/json")
-		responseWriter.WriteHeader(http.StatusBadRequest)
-
-		encodeErr := json.NewEncoder(responseWriter).Encode(response)
-		if encodeErr != nil {
-			s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to encode error response: %v", encodeErr))
-		}
-
+	var req internal.PaymentRequest
+	decodeErr := json.NewDecoder(request.Body).Decode(&req)
+	if decodeErr != nil {
+		s.errorJSON(ctx, writer, http.StatusBadRequest, "Invalid request body", "Failed to decode JSON request")
 		return
 	}
 
-	if paymentRequest.RequestedAt.IsZero() {
-		paymentRequest.RequestedAt = time.Now().UTC()
+	if req.RequestedAt.IsZero() {
+		req.RequestedAt = time.Now().UTC()
 	}
 
-	err = s.handler.ProcessPayment(ctx, &paymentRequest)
-	if err != nil {
-		s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to process payment: %v", err))
-
-		response := ErrorResponse{
-			Error:   "Failed to process payment",
-			Message: "Payment processing failed",
-		}
-
-		responseWriter.Header().Set("Content-Type", "application/json")
-		responseWriter.WriteHeader(http.StatusInternalServerError)
-
-		encodeErr := json.NewEncoder(responseWriter).Encode(response)
-		if encodeErr != nil {
-			s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to encode error response: %v", encodeErr))
-		}
-
+	processErr := s.handler.ProcessPayment(ctx, &req)
+	if processErr != nil {
+		s.errorJSON(ctx, writer, http.StatusInternalServerError, "Failed to process payment", "Payment processing failed")
 		return
 	}
 
-	s.logger.DebugContext(ctx, "Payment processed successfully")
-
-	response := map[string]string{"status": "processed"}
-
-	responseWriter.Header().Set("Content-Type", "application/json")
-	responseWriter.WriteHeader(http.StatusOK)
-
-	encodeErr := json.NewEncoder(responseWriter).Encode(response)
-	if encodeErr != nil {
-		s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to encode success response: %v", encodeErr))
-	}
+	s.respondJSON(ctx, writer, http.StatusOK, map[string]string{"status": "processed"})
 }
 
 func (s *Server) setupRoutes() {
@@ -338,75 +314,86 @@ func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/payments-summary", s.paymentsSummaryHandler)
 }
 
-func (s *Server) paymentsSummaryHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+func (s *Server) paymentsSummaryHandler(writer http.ResponseWriter, request *http.Request) { // route handler
+	if request.Method != http.MethodGet {
+		http.Error(writer, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Parse query parameters
-	fromStr := r.URL.Query().Get("from")
-	toStr := r.URL.Query().Get("to")
-
-	var from, to time.Time
-	var err error
-
-	if fromStr != "" {
-		from, err = time.Parse(time.RFC3339, fromStr)
-		if err != nil {
-			http.Error(w, "Invalid from parameter", http.StatusBadRequest)
-			return
-		}
-	} else {
-		from = time.Time{} // Zero time
-	}
-
-	if toStr != "" {
-		to, err = time.Parse(time.RFC3339, toStr)
-		if err != nil {
-			http.Error(w, "Invalid to parameter", http.StatusBadRequest)
-			return
-		}
-	} else {
-		to = time.Now()
-	}
-
-	// Get summaries from database
-	summaries, err := s.handler.GetPaymentsSummary(from, to)
+	fromTime, toTime, err := parseTimeRange(request.URL.Query().Get("from"), request.URL.Query().Get("to"))
 	if err != nil {
-		s.logger.ErrorContext(r.Context(), "Failed to read payments summary",
-			slog.String("error", err.Error()))
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		http.Error(writer, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// Format response
-	defaultAmount, defaultOk := summaries[0].TotalAmount.Float64()
-	if !defaultOk {
-		s.logger.ErrorContext(r.Context(), "Failed to convert default amount to float64")
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	summaries, err := s.handler.GetPaymentsSummary(fromTime, toTime)
+	if err != nil {
+		s.logger.ErrorContext(request.Context(), "Failed to read payments summary", slog.String("error", err.Error()))
+		http.Error(writer, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
 
-	fallbackAmount, fallbackOk := summaries[1].TotalAmount.Float64()
-	if !fallbackOk {
-		s.logger.ErrorContext(r.Context(), "Failed to convert fallback amount to float64")
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	defaultAmount, okDefault := summaries[0].TotalAmount.Float64()
+	if !okDefault {
+		http.Error(writer, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+	fallbackAmount, okFallback := summaries[1].TotalAmount.Float64()
+	if !okFallback {
+		http.Error(writer, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
 
-	response := map[string]interface{}{
-		"default": map[string]interface{}{
+	resp := map[string]any{
+		"default": map[string]any{
 			"totalRequests": summaries[0].TotalRequests,
 			"totalAmount":   defaultAmount,
 		},
-		"fallback": map[string]interface{}{
+		"fallback": map[string]any{
 			"totalRequests": summaries[1].TotalRequests,
 			"totalAmount":   fallbackAmount,
 		},
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+
+	s.respondJSON(request.Context(), writer, http.StatusOK, resp)
+}
+
+func parseTimeRange(fromStr, toStr string) (time.Time, time.Time, error) {
+	var from time.Time
+	if fromStr != "" {
+		parsedFrom, parseErr := time.Parse(time.RFC3339, fromStr)
+		if parseErr != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("invalid from parameter: %w", parseErr)
+		}
+
+		from = parsedFrom
+	}
+
+	toTime := time.Now()
+	if toStr != "" {
+		parsedTo, parseErr := time.Parse(time.RFC3339, toStr)
+		if parseErr != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("invalid to parameter: %w", parseErr)
+		}
+
+		toTime = parsedTo
+	}
+
+	return from, toTime, nil
+}
+
+func (s *Server) respondJSON(ctx context.Context, writer http.ResponseWriter, status int, payload any) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(status)
+
+	encodeErr := json.NewEncoder(writer).Encode(payload)
+	if encodeErr != nil {
+		s.logger.ErrorContext(ctx, "Failed to encode JSON response", slog.String("error", encodeErr.Error()))
+	}
+}
+
+func (s *Server) errorJSON(ctx context.Context, writer http.ResponseWriter, status int, errTitle, message string) {
+	s.respondJSON(ctx, writer, status, ErrorResponse{Error: errTitle, Message: message})
 }
 
 func main() {

@@ -1,4 +1,4 @@
-// Package internal provides payment client functionality for the payment gateway service.
+// Package internal provides the implementation for the payment gateway client and related utilities.
 package internal
 
 import (
@@ -60,10 +60,8 @@ func (c *PaymentClient) Shutdown() {
 	close(c.shutdown)
 }
 
-func (c *PaymentClient) processPayment(request *PaymentRequest) error {
+func (c *PaymentClient) processPayment(ctx context.Context, request *PaymentRequest) error {
 	c.count.Add(1)
-
-	ctx := context.Background()
 
 	var err error
 

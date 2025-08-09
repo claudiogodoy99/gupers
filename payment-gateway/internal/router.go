@@ -1,7 +1,5 @@
 package internal
 
-import "time"
-
 // Router handles payment processing and fallback logic.
 type Router struct {
 	paymentProcessorClient         *PaymentClient
@@ -33,8 +31,6 @@ func (r *Router) Shutdown() {
 func (r *Router) route() *PaymentClient {
 	const percentMultiplier = 100
 
-	const fallbackSleepDuration = 500 * time.Millisecond
-
 	channelUsage := len(r.pendingPaymentChan) * percentMultiplier / r.bufSize
 
 	if r.paymentProcessorClient.health.Load() || channelUsage <= r.threshold {
@@ -49,8 +45,6 @@ func (r *Router) route() *PaymentClient {
 
 			return r.paymentProcessorFallbackClient
 		}
-
-		time.Sleep(fallbackSleepDuration)
 
 		return r.paymentProcessorClient
 	}
