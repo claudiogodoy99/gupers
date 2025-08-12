@@ -12,8 +12,8 @@ import (
 
 // DBClient is the interface to interact with the database for payment requests.
 type DBClient interface {
-	Write(request PaymentRequest) error
-	Read(init, end time.Time) ([2]Summary, error)
+	Write(ctx context.Context, request PaymentRequest) error
+	Read(ctx context.Context, init, end time.Time) ([2]Summary, error)
 	Close() error
 }
 
@@ -37,7 +37,7 @@ const (
 )
 
 // NewPostgresDBClient Constructor PostgresDBClient.
-func NewPostgresDBClient(connectionString string) (*PostgresDBClient, error) {
+func NewPostgresDBClient(ctx context.Context, connectionString string) (*PostgresDBClient, error) {
 	sqlDB, err := sql.Open("postgres", connectionString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database connection: %w", err)
@@ -46,8 +46,6 @@ func NewPostgresDBClient(connectionString string) (*PostgresDBClient, error) {
 	sqlDB.SetMaxOpenConns(maxOpenConns)
 	sqlDB.SetMaxIdleConns(maxIdleConns)
 	sqlDB.SetConnMaxLifetime(connMaxLifetime)
-
-	ctx := context.Background()
 
 	var pingErr error
 	for attempt := 1; attempt <= pingMaxRetries; attempt++ {
@@ -66,13 +64,11 @@ func NewPostgresDBClient(connectionString string) (*PostgresDBClient, error) {
 	return &PostgresDBClient{db: sqlDB}, nil
 }
 
-func (p *PostgresDBClient) Write(request PaymentRequest) error {
+func (p *PostgresDBClient) Write(ctx context.Context, request PaymentRequest) error {
 	query := `
         INSERT INTO payments (correlationId, amount, requested_at) 
         VALUES ($1, $2, $3)
         ON CONFLICT (correlationId) DO NOTHING`
-
-	ctx := context.Background()
 
 	_, err := p.db.ExecContext(ctx, query, request.CorrelationID, request.Amount, request.RequestedAt)
 	if err != nil {
@@ -82,7 +78,7 @@ func (p *PostgresDBClient) Write(request PaymentRequest) error {
 	return nil
 }
 
-func (p *PostgresDBClient) Read(init, end time.Time) ([2]Summary, error) {
+func (p *PostgresDBClient) Read(ctx context.Context, init, end time.Time) ([2]Summary, error) {
 	var summaries [2]Summary
 
 	query := `
@@ -95,8 +91,6 @@ func (p *PostgresDBClient) Read(init, end time.Time) ([2]Summary, error) {
 	var totalRequests int
 
 	var totalAmountFloat64 float64
-
-	ctx := context.Background()
 
 	err := p.db.QueryRowContext(ctx, query, init, end).Scan(&totalRequests, &totalAmountFloat64)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {

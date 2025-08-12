@@ -41,7 +41,10 @@ type PaymentClient struct {
 }
 
 // NewPaymentClient creates a new PaymentClient instance for interacting with the payment gateway.
-func NewPaymentClient(httpClient *http.Client, url, healthCheckURL string, logger *slog.Logger) *PaymentClient {
+func NewPaymentClient(ctx context.Context,
+	httpClient *http.Client, url, healthCheckURL string,
+	logger *slog.Logger,
+) *PaymentClient {
 	client := &PaymentClient{
 		httpClient:     httpClient,
 		shutdown:       make(chan struct{}),
@@ -50,7 +53,7 @@ func NewPaymentClient(httpClient *http.Client, url, healthCheckURL string, logge
 		serverLogger:   logger,
 	}
 
-	go client.monitorClient()
+	go client.monitorClient(ctx)
 
 	return client
 }
@@ -106,15 +109,19 @@ func (c *PaymentClient) processPayment(ctx context.Context, request *PaymentRequ
 	return nil
 }
 
-func (c *PaymentClient) monitorClient() {
+func (c *PaymentClient) monitorClient(ctx context.Context) {
 	ticker := time.NewTicker(healthCheckInterval * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			c.performHealthCheck()
+			c.performHealthCheck(ctx)
 		case <-c.shutdown:
+			return
+		case <-ctx.Done():
+			close(c.shutdown)
+
 			return
 		}
 	}
@@ -124,8 +131,7 @@ func (c *PaymentClient) update(available bool) {
 	c.health.Store(available)
 }
 
-func (c *PaymentClient) performHealthCheck() {
-	ctx := context.Background()
+func (c *PaymentClient) performHealthCheck(ctx context.Context) {
 	c.serverLogger.DebugContext(ctx, "health checking endpoint: "+c.healthCheckURL)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.healthCheckURL, nil)

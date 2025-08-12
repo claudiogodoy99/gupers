@@ -79,12 +79,12 @@ func (p *PaymentHandler) ProcessPayment(ctx context.Context, request *PaymentReq
 }
 
 // GetPaymentsSummary returns payment summaries for the provided time window.
-func (p *PaymentHandler) GetPaymentsSummary(from, to time.Time) ([2]Summary, error) {
+func (p *PaymentHandler) GetPaymentsSummary(ctx context.Context, from, to time.Time) ([2]Summary, error) {
 	if p.dbClient == nil {
 		return [2]Summary{}, ErrDBClientUnavailable
 	}
 
-	summaries, err := p.dbClient.Read(from, to)
+	summaries, err := p.dbClient.Read(ctx, from, to)
 	if err != nil {
 		return [2]Summary{}, fmt.Errorf("read payments summary: %w", err)
 	}
@@ -131,7 +131,7 @@ func (p *PaymentHandler) processPaymentWorker() {
 }
 
 func (p *PaymentHandler) sendToDB(ctx context.Context, request *PaymentRequest) error {
-	err := p.dbClient.Write(*request)
+	err := p.dbClient.Write(ctx, *request)
 	if err == nil {
 		return nil
 	}

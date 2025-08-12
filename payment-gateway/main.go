@@ -123,10 +123,10 @@ func createHTTPClients() httpClients {
 	}
 }
 
-func createPaymentClients(clients httpClients, config configuration, logger *slog.Logger) paymentClients {
+func createPaymentClients(ctx context.Context, clients httpClients, config configuration, logger *slog.Logger) paymentClients {
 	return paymentClients{
-		primary:  internal.NewPaymentClient(clients.primary, config.primaryURL, config.primaryHealthURL, logger),
-		fallback: internal.NewPaymentClient(clients.fallback, config.fallbackURL, config.fallbackHealthURL, logger),
+		primary:  internal.NewPaymentClient(ctx, clients.primary, config.primaryURL, config.primaryHealthURL, logger),
+		fallback: internal.NewPaymentClient(ctx, clients.fallback, config.fallbackURL, config.fallbackHealthURL, logger),
 	}
 }
 
@@ -201,11 +201,15 @@ func mustGetEnv(key string) string {
 	if v == "" {
 		panic(key + " not set")
 	}
+
 	return v
 }
 
-func initDBClient(ctx context.Context, logger *slog.Logger, dbURL string) *internal.PostgresDBClient { // concrete type to satisfy ireturn
-	dbClient, err := internal.NewPostgresDBClient(dbURL)
+func initDBClient(ctx context.Context,
+	logger *slog.Logger,
+	dbURL string,
+) *internal.PostgresDBClient {
+	dbClient, err := internal.NewPostgresDBClient(ctx, dbURL)
 	if err != nil {
 		logger.ErrorContext(ctx, "Failed to create database client", slog.String("error", err.Error()))
 		panic(fmt.Sprintf("failed to initialize database client: %v", err))
@@ -230,7 +234,7 @@ func buildPaymentHandler(
 	dbClient internal.DBClient,
 ) *internal.PaymentHandler {
 	clients := createHTTPClients()
-	paymentClients := createPaymentClients(clients, cfg, logger)
+	paymentClients := createPaymentClients(ctx, clients, cfg, logger)
 	workerConf := loadWorkerConfiguration(ctx, logger)
 
 	logger.InfoContext(ctx, "Payment handler configuration",
@@ -283,6 +287,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 func (s *Server) paymentsHandler(writer http.ResponseWriter, request *http.Request) { // route handler
 	if request.Method != http.MethodPost {
 		http.Error(writer, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+
 		return
 	}
 
@@ -290,9 +295,11 @@ func (s *Server) paymentsHandler(writer http.ResponseWriter, request *http.Reque
 	s.logger.DebugContext(ctx, "Payment request received")
 
 	var req internal.PaymentRequest
+
 	decodeErr := json.NewDecoder(request.Body).Decode(&req)
 	if decodeErr != nil {
 		s.errorJSON(ctx, writer, http.StatusBadRequest, "Invalid request body", "Failed to decode JSON request")
+
 		return
 	}
 
@@ -303,6 +310,7 @@ func (s *Server) paymentsHandler(writer http.ResponseWriter, request *http.Reque
 	processErr := s.handler.ProcessPayment(ctx, &req)
 	if processErr != nil {
 		s.errorJSON(ctx, writer, http.StatusInternalServerError, "Failed to process payment", "Payment processing failed")
+
 		return
 	}
 
@@ -317,30 +325,36 @@ func (s *Server) setupRoutes() {
 func (s *Server) paymentsSummaryHandler(writer http.ResponseWriter, request *http.Request) { // route handler
 	if request.Method != http.MethodGet {
 		http.Error(writer, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+
 		return
 	}
 
 	fromTime, toTime, err := parseTimeRange(request.URL.Query().Get("from"), request.URL.Query().Get("to"))
 	if err != nil {
 		http.Error(writer, err.Error(), http.StatusBadRequest)
+
 		return
 	}
 
-	summaries, err := s.handler.GetPaymentsSummary(fromTime, toTime)
+	summaries, err := s.handler.GetPaymentsSummary(request.Context(), fromTime, toTime)
 	if err != nil {
 		s.logger.ErrorContext(request.Context(), "Failed to read payments summary", slog.String("error", err.Error()))
 		http.Error(writer, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+
 		return
 	}
 
 	defaultAmount, okDefault := summaries[0].TotalAmount.Float64()
 	if !okDefault {
 		http.Error(writer, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+
 		return
 	}
+
 	fallbackAmount, okFallback := summaries[1].TotalAmount.Float64()
 	if !okFallback {
 		http.Error(writer, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+
 		return
 	}
 
