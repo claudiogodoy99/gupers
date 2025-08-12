@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/claudiogodoy/gupers/payment-gateway/internal"
-	_ "github.com/jackc/pgx"
 )
 
 const (
@@ -169,7 +168,7 @@ func NewServer() *Server { // function length acceptable due to setup logic
 	port := getEnvDefault("PORT", "8080")
 	dbURL := mustGetEnv("DATABASE_URL")
 	logger := newLogger()
-	dbClient := initDBClient(ctx, logger, dbURL)
+	dbClient := internal.NewPostgresDBClient(ctx, dbURL)
 	config := loadConfiguration()
 	logConfiguration(ctx, logger, config)
 
@@ -205,19 +204,6 @@ func mustGetEnv(key string) string {
 	}
 
 	return v
-}
-
-func initDBClient(ctx context.Context,
-	logger *slog.Logger,
-	dbURL string,
-) *internal.PostgresDBClient {
-	dbClient, err := internal.NewPostgresDBClient(ctx, dbURL)
-	if err != nil {
-		logger.ErrorContext(ctx, "Failed to create database client", slog.String("error", err.Error()))
-		panic(fmt.Sprintf("failed to initialize database client: %v", err))
-	}
-
-	return dbClient
 }
 
 func logConfiguration(ctx context.Context, logger *slog.Logger, cfg configuration) {
