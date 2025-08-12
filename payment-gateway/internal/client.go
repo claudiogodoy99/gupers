@@ -1,4 +1,4 @@
-// Package internal provides payment client functionality for the payment gateway service.
+// Package internal provides the implementation for the payment gateway client and related utilities.
 package internal
 
 import (
@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"sync/atomic"
@@ -41,17 +42,19 @@ type PaymentClient struct {
 }
 
 // NewPaymentClient creates a new PaymentClient instance for interacting with the payment gateway.
-func NewPaymentClient(httpClient *http.Client, url, healthCheckURL string, logger *slog.Logger) *PaymentClient {
+func NewPaymentClient(ctx context.Context,
+	httpClient *http.Client, url, healthCheckURL string,
+	logger *slog.Logger,
+) *PaymentClient {
 	client := &PaymentClient{
-		httpClient: httpClient,
-
+		httpClient:     httpClient,
 		shutdown:       make(chan struct{}),
 		url:            url,
 		healthCheckURL: healthCheckURL,
 		serverLogger:   logger,
 	}
 
-	go client.monitorClient()
+	go client.monitorClient(ctx)
 
 	return client
 }
@@ -61,10 +64,8 @@ func (c *PaymentClient) Shutdown() {
 	close(c.shutdown)
 }
 
-func (c *PaymentClient) processPayment(request *PaymentRequest) error {
+func (c *PaymentClient) processPayment(ctx context.Context, request *PaymentRequest) error {
 	c.count.Add(1)
-
-	ctx := context.Background()
 
 	var err error
 
@@ -87,6 +88,7 @@ func (c *PaymentClient) processPayment(request *PaymentRequest) error {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.ContentLength = int64(len(jsonData))
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -96,6 +98,11 @@ func (c *PaymentClient) processPayment(request *PaymentRequest) error {
 	}
 
 	defer func() {
+		_, copyErr := io.Copy(io.Discard, resp.Body)
+		if copyErr != nil {
+			c.serverLogger.WarnContext(ctx, "drain response body failed", "err", copyErr)
+		}
+
 		closeErr := resp.Body.Close()
 		if closeErr != nil {
 			c.serverLogger.ErrorContext(ctx, fmt.Sprintf("failed to close response body: %v", closeErr))
@@ -109,15 +116,19 @@ func (c *PaymentClient) processPayment(request *PaymentRequest) error {
 	return nil
 }
 
-func (c *PaymentClient) monitorClient() {
+func (c *PaymentClient) monitorClient(ctx context.Context) {
 	ticker := time.NewTicker(healthCheckInterval * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			c.performHealthCheck()
+			c.performHealthCheck(ctx)
 		case <-c.shutdown:
+			return
+		case <-ctx.Done():
+			close(c.shutdown)
+
 			return
 		}
 	}
@@ -127,8 +138,7 @@ func (c *PaymentClient) update(available bool) {
 	c.health.Store(available)
 }
 
-func (c *PaymentClient) performHealthCheck() {
-	ctx := context.Background()
+func (c *PaymentClient) performHealthCheck(ctx context.Context) {
 	c.serverLogger.DebugContext(ctx, "health checking endpoint: "+c.healthCheckURL)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.healthCheckURL, nil)

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net/http"
@@ -23,7 +24,7 @@ const (
 	httpClientTimeout  = 30
 	serverReadTimeout  = 15
 	serverWriteTimeout = 15
-	serverIdleTimeout  = 60
+	serverIdleTimeout  = 120
 	shutdownTimeout    = 30
 
 	defaultChannelLen = 1000
@@ -110,20 +111,41 @@ func loadConfiguration() configuration {
 }
 
 func createHTTPClients() httpClients {
+	const (
+		MaxIdleConns        = 1024
+		MaxIdleConnsPerHost = 256
+		IdleConnTimeout     = 90 * time.Second
+	)
+
+	trConfig := &http.Transport{
+		MaxIdleConns:        MaxIdleConns,
+		MaxIdleConnsPerHost: MaxIdleConnsPerHost,
+		MaxConnsPerHost:     0,
+		IdleConnTimeout:     IdleConnTimeout,
+		DisableKeepAlives:   false,
+		ForceAttemptHTTP2:   true,
+	}
+
 	return httpClients{
 		primary: &http.Client{
-			Timeout: httpClientTimeout * time.Second,
+			Timeout:   httpClientTimeout * time.Second,
+			Transport: trConfig,
 		},
 		fallback: &http.Client{
-			Timeout: httpClientTimeout * time.Second,
+			Timeout:   httpClientTimeout * time.Second,
+			Transport: trConfig,
 		},
 	}
 }
 
-func createPaymentClients(clients httpClients, config configuration, logger *slog.Logger) paymentClients {
+func createPaymentClients(ctx context.Context,
+	clients httpClients,
+	config configuration,
+	logger *slog.Logger,
+) paymentClients {
 	return paymentClients{
-		primary:  internal.NewPaymentClient(clients.primary, config.primaryURL, config.primaryHealthURL, logger),
-		fallback: internal.NewPaymentClient(clients.fallback, config.fallbackURL, config.fallbackHealthURL, logger),
+		primary:  internal.NewPaymentClient(ctx, clients.primary, config.primaryURL, config.primaryHealthURL, logger),
+		fallback: internal.NewPaymentClient(ctx, clients.fallback, config.fallbackURL, config.fallbackHealthURL, logger),
 	}
 }
 
@@ -158,44 +180,19 @@ func loadWorkerConfiguration(ctx context.Context, logger *slog.Logger) workerCon
 	}
 }
 
-func NewServer() *Server {
+func NewServer() *Server { // function length acceptable due to setup logic
 	ctx := context.Background()
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
+	port := getEnvDefault("PORT", "8080")
+	dbURL := mustGetEnv("DATABASE_URL")
+	logger := newLogger()
 
+	dbClient := internal.NewPostgresDBClient(ctx, dbURL)
 	config := loadConfiguration()
-
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-
-	logger.InfoContext(ctx, "Payment processor configuration ",
-		slog.String("primary_url", config.primaryURL),
-		slog.String("primary_health_url", config.primaryHealthURL),
-		slog.String("fallback_url", config.fallbackURL),
-		slog.String("fallback_health_url", config.fallbackHealthURL),
-	)
+	logConfiguration(ctx, logger, config)
 
 	mux := http.NewServeMux()
-
-	clients := createHTTPClients()
-	paymentClients := createPaymentClients(clients, config, logger)
-	workerConfig := loadWorkerConfiguration(ctx, logger)
-
-	logger.InfoContext(ctx, "Payment handler configuration",
-		slog.Int("channel_len", workerConfig.channelLen),
-		slog.Int("num_workers", workerConfig.numWorkers),
-	)
-
-	channel := make(chan *internal.PaymentRequest, workerConfig.channelLen)
-	router := internal.NewRouter(config.routerThreshold,
-		workerConfig.channelLen,
-		channel,
-		paymentClients.primary,
-		paymentClients.fallback)
-
-	paymentHandler := internal.NewPaymentHandler(router, workerConfig.numWorkers, channel, logger)
+	paymentHandler := buildPaymentHandler(ctx, config, logger, dbClient)
 
 	server := &http.Server{
 		Addr:         ":" + port,
@@ -205,13 +202,70 @@ func NewServer() *Server {
 		IdleTimeout:  serverIdleTimeout * time.Second,
 	}
 
-	return &Server{
-		port:    port,
-		mux:     mux,
-		server:  server,
-		handler: paymentHandler,
-		logger:  logger,
+	return &Server{port: port, mux: mux, server: server, handler: paymentHandler, logger: logger}
+}
+
+func newLogger() *slog.Logger {
+	var levelVar slog.LevelVar
+	levelVar.Set(slog.LevelError)
+
+	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: &levelVar,
+	}))
+}
+
+func getEnvDefault(key, def string) string {
+	val := os.Getenv(key)
+	if val != "" {
+		return val
 	}
+
+	return def
+}
+
+func mustGetEnv(key string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		panic(key + " not set")
+	}
+
+	return v
+}
+
+func logConfiguration(ctx context.Context, logger *slog.Logger, cfg configuration) {
+	logger.InfoContext(ctx, "Payment processor configuration",
+		slog.String("primary_url", cfg.primaryURL),
+		slog.String("primary_health_url", cfg.primaryHealthURL),
+		slog.String("fallback_url", cfg.fallbackURL),
+		slog.String("fallback_health_url", cfg.fallbackHealthURL),
+	)
+}
+
+func buildPaymentHandler(
+	ctx context.Context,
+	cfg configuration,
+	logger *slog.Logger,
+	dbClient internal.DBClient,
+) *internal.PaymentHandler {
+	clients := createHTTPClients()
+	paymentClients := createPaymentClients(ctx, clients, cfg, logger)
+	workerConf := loadWorkerConfiguration(ctx, logger)
+
+	logger.InfoContext(ctx, "Payment handler configuration",
+		slog.Int("channel_len", workerConf.channelLen),
+		slog.Int("num_workers", workerConf.numWorkers),
+	)
+
+	channel := make(chan *internal.PaymentRequest, workerConf.channelLen)
+	router := internal.NewRouter(
+		cfg.routerThreshold,
+		workerConf.channelLen,
+		channel,
+		paymentClients.primary,
+		paymentClients.fallback,
+	)
+
+	return internal.NewPaymentHandler(ctx, router, workerConf.numWorkers, channel, logger, dbClient)
 }
 
 func (s *Server) Start() error {
@@ -244,71 +298,155 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) paymentsHandler(responseWriter http.ResponseWriter, request *http.Request) {
-	if request.Method != http.MethodPost {
-		return
-	}
-
+func (s *Server) paymentsHandler(writer http.ResponseWriter, request *http.Request) {
 	ctx := request.Context()
-	s.logger.DebugContext(ctx, "Payment request received")
 
-	var paymentRequest internal.PaymentRequest
-
-	err := json.NewDecoder(request.Body).Decode(&paymentRequest)
-	if err != nil {
-		s.logger.ErrorContext(ctx, fmt.Sprintf("error on decode json: %v", err))
-
-		response := ErrorResponse{
-			Error:   "Invalid request body",
-			Message: "Failed to decode JSON request",
+	defer func() {
+		_, copyErr := io.Copy(io.Discard, request.Body)
+		if copyErr != nil {
+			s.logger.WarnContext(ctx, "drain response body failed", "err", copyErr)
 		}
 
-		responseWriter.Header().Set("Content-Type", "application/json")
-		responseWriter.WriteHeader(http.StatusBadRequest)
-
-		encodeErr := json.NewEncoder(responseWriter).Encode(response)
-		if encodeErr != nil {
-			s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to encode error response: %v", encodeErr))
+		err := request.Body.Close()
+		if err != nil {
+			s.logger.ErrorContext(ctx, "Failed to close request body", slog.String("error", err.Error()))
 		}
+	}()
+
+	if request.Method != http.MethodPost {
+		http.Error(writer, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 
 		return
 	}
 
-	err = s.handler.ProcessPayment(ctx, &paymentRequest)
-	if err != nil {
-		s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to process payment: %v", err))
+	var req internal.PaymentRequest
 
-		response := ErrorResponse{
-			Error:   "Failed to process payment",
-			Message: "Payment processing failed",
-		}
-
-		responseWriter.Header().Set("Content-Type", "application/json")
-		responseWriter.WriteHeader(http.StatusInternalServerError)
-
-		encodeErr := json.NewEncoder(responseWriter).Encode(response)
-		if encodeErr != nil {
-			s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to encode error response: %v", encodeErr))
-		}
+	decodeErr := json.NewDecoder(request.Body).Decode(&req)
+	if decodeErr != nil {
+		s.errorJSON(ctx, writer, http.StatusBadRequest, "Invalid request body", "Failed to decode JSON request")
 
 		return
 	}
 
-	s.logger.DebugContext(ctx, "Payment processed successfully")
-
-	response := map[string]string{"status": "processed"}
-
-	responseWriter.Header().Set("Content-Type", "application/json")
-	responseWriter.WriteHeader(http.StatusOK)
-
-	encodeErr := json.NewEncoder(responseWriter).Encode(response)
-	if encodeErr != nil {
-		s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to encode success response: %v", encodeErr))
+	if req.RequestedAt.IsZero() {
+		req.RequestedAt = time.Now().UTC()
 	}
+
+	processErr := s.handler.ProcessPayment(ctx, &req)
+	if processErr != nil {
+		s.errorJSON(ctx, writer, http.StatusInternalServerError, "Failed to process payment", "Payment processing failed")
+
+		return
+	}
+
+	writer.Header().Set("Content-Type", "application/json")
+	writer.Header().Set("Content-Length", "0")
 }
 
 func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/payments", s.paymentsHandler)
+	s.mux.HandleFunc("/payments-summary", s.paymentsSummaryHandler)
+}
+
+func (s *Server) paymentsSummaryHandler(writer http.ResponseWriter, request *http.Request) { // route handler
+	if request.Method != http.MethodGet {
+		http.Error(writer, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+
+		return
+	}
+
+	fromTime, toTime, err := parseTimeRange(request.URL.Query().Get("from"), request.URL.Query().Get("to"))
+	if err != nil {
+		http.Error(writer, err.Error(), http.StatusBadRequest)
+
+		return
+	}
+
+	ctx := request.Context()
+
+	defer func() {
+		_, copyErr := io.Copy(io.Discard, request.Body)
+		if copyErr != nil {
+			s.logger.WarnContext(ctx, "drain response body failed", "err", copyErr)
+		}
+
+		err := request.Body.Close()
+		if err != nil {
+			s.logger.ErrorContext(ctx, fmt.Sprintf("error on defer %v", err))
+		}
+	}()
+
+	summaries, err := s.handler.GetPaymentsSummary(ctx, fromTime, toTime)
+	if err != nil {
+		s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to read payments summary, %v", err))
+		http.Error(writer, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+
+		return
+	}
+
+	resp := map[string]any{
+		"default": map[string]any{
+			"totalRequests": summaries[0].TotalRequests,
+			"totalAmount":   summaries[0].TotalAmount,
+		},
+		"fallback": map[string]any{
+			"totalRequests": summaries[1].TotalRequests,
+			"totalAmount":   summaries[1].TotalAmount,
+		},
+	}
+
+	writer.Header().Set("Content-Type", "application/json")
+	writer.Header().Set("Content-Length", "0")
+
+	bResp, err := json.Marshal(resp)
+	if err != nil {
+		s.errorJSON(ctx, writer, http.StatusInternalServerError, "encode error", "marshal resp failed")
+
+		return
+	}
+
+	writer.Header().Set("Content-Type", "application/json")
+	writer.Header().Set("Content-Length", strconv.Itoa(len(bResp))) // correct length
+	writer.WriteHeader(http.StatusOK)
+	_, _ = writer.Write(bResp)
+}
+
+func parseTimeRange(fromStr, toStr string) (time.Time, time.Time, error) {
+	var from time.Time
+	if fromStr != "" {
+		parsedFrom, parseErr := time.Parse(time.RFC3339, fromStr)
+		if parseErr != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("invalid from parameter: %w", parseErr)
+		}
+
+		from = parsedFrom
+	}
+
+	toTime := time.Now()
+	if toStr != "" {
+		parsedTo, parseErr := time.Parse(time.RFC3339, toStr)
+		if parseErr != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("invalid to parameter: %w", parseErr)
+		}
+
+		toTime = parsedTo
+	}
+
+	return from, toTime, nil
+}
+
+func (s *Server) respondJSON(ctx context.Context, writer http.ResponseWriter, status int, payload any) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(status)
+
+	encodeErr := json.NewEncoder(writer).Encode(payload)
+	if encodeErr != nil {
+		s.logger.ErrorContext(ctx, "Failed to encode JSON response", slog.String("error", encodeErr.Error()))
+	}
+}
+
+func (s *Server) errorJSON(ctx context.Context, writer http.ResponseWriter, status int, errTitle, message string) {
+	s.respondJSON(ctx, writer, status, ErrorResponse{Error: errTitle, Message: message})
 }
 
 func main() {

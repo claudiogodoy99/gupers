@@ -1,4 +1,20 @@
 x-service-templates:
+  payment-gateway-db: &payment-gateway-db
+    image: postgres:17-alpine
+    networks:
+      - payment-gateway-db
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    environment:
+      - POSTGRES_PASSWORD=gateway
+      - POSTGRES_USER=gateway
+      - POSTGRES_DB=gateway
+    deploy:
+      resources:
+        limits:
+          cpus: "0.4"
+          memory: "120MB"
+          
   payment-processor: &payment-processor
     image: zanfranceschi/payment-processor:amd64-20250707101540
     networks:
@@ -68,7 +84,18 @@ services:
     container_name: payment-processor-fallback-db
     hostname: payment-processor-fallback-db
 
-  # Load Balancer (Envoy)
+  # Payment Gateway Database
+  payment-gateway-db:
+    <<: *payment-gateway-db
+    container_name: payment-gateway-db
+    hostname: payment-gateway-db
+    deploy:
+      resources:
+        limits:
+          cpus: "0.3"
+          memory: "120MB"
+
+  #Load Balancer (Envoy)
   envoy:
     image: envoyproxy/envoy:v1.28-latest
     container_name: payment-gateway-envoy
@@ -85,7 +112,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.2"
+          cpus: "0.4"
           memory: "50MB"
 
   # Payment Gateway Instance 1
@@ -97,22 +124,25 @@ services:
     hostname: payment-gateway-1
     environment:
       - PORT=8080
+      - DATABASE_URL=postgres://gateway:gateway@payment-gateway-db:5432/gateway?sslmode=disable
       - PRIMARY_PAYMENT_PROCESSOR_URL=http://payment-processor-default:8080/payments
       - PRIMARY_PAYMENT_PROCESSOR_HEALTH_URL=http://payment-processor-default:8080/payments/service-health
       - FALLBACK_PAYMENT_PROCESSOR_URL=http://payment-processor-fallback:8080/payments
       - FALLBACK_PAYMENT_PROCESSOR_HEALTH_URL=http://payment-processor-fallback:8080/payments/service-health
-      - PAYMENT_CHANNEL_LEN=1000
-      - PAYMENT_NUM_WORKERS=20
+      - PAYMENT_CHANNEL_LEN=10000
+      - PAYMENT_NUM_WORKERS=64
     depends_on:
+      - payment-gateway-db
       - payment-processor-1
       - payment-processor-2
     networks:
+      - payment-gateway-db
       - payment-processor
     deploy:
       resources:
         limits:
-          cpus: "0.6"
-          memory: "100MB"
+          cpus: "0.4"
+          memory: "90MB"
 
   # Payment Gateway Instance 2
   payment-gateway-2:
@@ -123,22 +153,25 @@ services:
     hostname: payment-gateway-2
     environment:
       - PORT=8080
+      - DATABASE_URL=postgres://gateway:gateway@payment-gateway-db:5432/gateway?sslmode=disable
       - PRIMARY_PAYMENT_PROCESSOR_URL=http://payment-processor-default:8080/payments
       - PRIMARY_PAYMENT_PROCESSOR_HEALTH_URL=http://payment-processor-default:8080/payments/service-health
       - FALLBACK_PAYMENT_PROCESSOR_URL=http://payment-processor-fallback:8080/payments
       - FALLBACK_PAYMENT_PROCESSOR_HEALTH_URL=http://payment-processor-fallback:8080/payments/service-health
-      - PAYMENT_CHANNEL_LEN=1000
-      - PAYMENT_NUM_WORKERS=20
+      - PAYMENT_CHANNEL_LEN=10000
+      - PAYMENT_NUM_WORKERS=64
     depends_on:
+      - payment-gateway-db
       - payment-processor-1
       - payment-processor-2
     networks:
+      - payment-gateway-db
       - payment-processor
     deploy:
       resources:
         limits:
-          cpus: "0.6"
-          memory: "100MB"
+          cpus: "0.4"
+          memory: "90MB"
           
 networks:
   payment-processor:
