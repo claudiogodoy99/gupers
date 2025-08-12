@@ -100,7 +100,6 @@ func (p *PaymentHandler) Shutdown() {
 }
 
 func (p *PaymentHandler) processPaymentWorker(ctx context.Context) {
-
 	for {
 		select {
 		case request := <-p.pendingPaymentChan:
