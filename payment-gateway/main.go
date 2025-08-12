@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/claudiogodoy/gupers/payment-gateway/internal"
-	_ "github.com/lib/pq"
+	_ "github.com/jackc/pgx"
 )
 
 const (
