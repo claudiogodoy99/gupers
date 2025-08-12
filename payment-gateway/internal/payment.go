@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"time"
 )
 
@@ -144,9 +145,9 @@ func (p *PaymentHandler) sendToDB(ctx context.Context, request *PaymentRequest) 
 
 func retryEngine(action func() error) {
 	const (
-		initialBackoff   = 500 * time.Millisecond
-		maxBackoff       = 2 * time.Second
-		incrementBackoff = 500 * time.Millisecond
+		initialBackoff     = 10 * time.Millisecond
+		maxBackoff         = 5 * time.Second
+		maxRandomIncrement = 100
 	)
 
 	backoff := initialBackoff
@@ -157,10 +158,15 @@ func retryEngine(action func() error) {
 			return
 		}
 
-		time.Sleep(backoff)
+		//nolint: gosec
+		// Use of weak random number generator.
+		// See https://cwe.mitre.org/data/definitions/338.html.
+		// The issue is valid when using in security context.
+		randomIncrement := time.Duration(rand.IntN(maxRandomIncrement)) * time.Millisecond
+		time.Sleep(backoff + randomIncrement)
 
 		if backoff < maxBackoff {
-			backoff += incrementBackoff
+			backoff *= 2
 			if backoff > maxBackoff {
 				backoff = maxBackoff
 			}
