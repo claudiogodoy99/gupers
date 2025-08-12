@@ -15,6 +15,7 @@ linters:
             - $gostd
             - github.com/govalues/decimal
             - github.com/claudiogodoy/gupers/payment-gateway/internal
+            - github.com/jackc/pgx
         test:
           files:
             - $test

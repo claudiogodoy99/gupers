@@ -1,7 +1,5 @@
 // Package main implements a payment gateway service that provides high availability
 // payment processing with primary and fallback payment processors.
-//
-//nolint:depguard
 package main
 
 import (
@@ -123,7 +121,11 @@ func createHTTPClients() httpClients {
 	}
 }
 
-func createPaymentClients(ctx context.Context, clients httpClients, config configuration, logger *slog.Logger) paymentClients {
+func createPaymentClients(ctx context.Context,
+	clients httpClients,
+	config configuration,
+	logger *slog.Logger,
+) paymentClients {
 	return paymentClients{
 		primary:  internal.NewPaymentClient(ctx, clients.primary, config.primaryURL, config.primaryHealthURL, logger),
 		fallback: internal.NewPaymentClient(ctx, clients.fallback, config.fallbackURL, config.fallbackHealthURL, logger),
