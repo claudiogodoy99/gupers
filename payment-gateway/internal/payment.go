@@ -28,7 +28,7 @@ type PaymentHandler struct {
 
 // NewPaymentHandler creates a new payment handler with the specified clients and worker configuration.
 // It starts the specified number of workers to process payments asynchronously.
-func NewPaymentHandler(
+func NewPaymentHandler(ctx context.Context,
 	router *Router,
 	numWorkers int,
 	pendingChan chan *PaymentRequest,
@@ -43,8 +43,8 @@ func NewPaymentHandler(
 		dbClient:           dbClient,
 	}
 
-	for range numWorkers { // start worker goroutines (Go 1.22 integer range)
-		go payment.processPaymentWorker()
+	for range numWorkers {
+		go payment.processPaymentWorker(ctx)
 	}
 
 	return payment
@@ -99,8 +99,7 @@ func (p *PaymentHandler) Shutdown() {
 	close(p.shutdown)
 }
 
-func (p *PaymentHandler) processPaymentWorker() {
-	ctx := context.Background()
+func (p *PaymentHandler) processPaymentWorker(ctx context.Context) {
 
 	for {
 		select {

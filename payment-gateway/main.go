@@ -253,7 +253,7 @@ func buildPaymentHandler(
 		paymentClients.fallback,
 	)
 
-	return internal.NewPaymentHandler(router, workerConf.numWorkers, channel, logger, dbClient)
+	return internal.NewPaymentHandler(ctx, router, workerConf.numWorkers, channel, logger, dbClient)
 }
 
 func (s *Server) Start() error {
