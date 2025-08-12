@@ -89,8 +89,13 @@ services:
     <<: *payment-gateway-db
     container_name: payment-gateway-db
     hostname: payment-gateway-db
+    deploy:
+      resources:
+        limits:
+          cpus: "0.3"
+          memory: "120MB"
 
-  # Load Balancer (Envoy)
+  #Load Balancer (Envoy)
   envoy:
     image: envoyproxy/envoy:v1.28-latest
     container_name: payment-gateway-envoy
@@ -107,7 +112,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.2"
+          cpus: "0.4"
           memory: "50MB"
 
   # Payment Gateway Instance 1
@@ -124,8 +129,8 @@ services:
       - PRIMARY_PAYMENT_PROCESSOR_HEALTH_URL=http://payment-processor-default:8080/payments/service-health
       - FALLBACK_PAYMENT_PROCESSOR_URL=http://payment-processor-fallback:8080/payments
       - FALLBACK_PAYMENT_PROCESSOR_HEALTH_URL=http://payment-processor-fallback:8080/payments/service-health
-      - PAYMENT_CHANNEL_LEN=1000
-      - PAYMENT_NUM_WORKERS=20
+      - PAYMENT_CHANNEL_LEN=10000
+      - PAYMENT_NUM_WORKERS=64
     depends_on:
       - payment-gateway-db
       - payment-processor-1
@@ -136,8 +141,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.6"
-          memory: "100MB"
+          cpus: "0.4"
+          memory: "90MB"
 
   # Payment Gateway Instance 2
   payment-gateway-2:
@@ -153,8 +158,8 @@ services:
       - PRIMARY_PAYMENT_PROCESSOR_HEALTH_URL=http://payment-processor-default:8080/payments/service-health
       - FALLBACK_PAYMENT_PROCESSOR_URL=http://payment-processor-fallback:8080/payments
       - FALLBACK_PAYMENT_PROCESSOR_HEALTH_URL=http://payment-processor-fallback:8080/payments/service-health
-      - PAYMENT_CHANNEL_LEN=1000
-      - PAYMENT_NUM_WORKERS=20
+      - PAYMENT_CHANNEL_LEN=10000
+      - PAYMENT_NUM_WORKERS=64
     depends_on:
       - payment-gateway-db
       - payment-processor-1
@@ -165,8 +170,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.6"
-          memory: "100MB"
+          cpus: "0.4"
+          memory: "90MB"
           
 networks:
   payment-processor:

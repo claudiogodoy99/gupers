@@ -16,6 +16,7 @@ linters:
             - github.com/govalues/decimal
             - github.com/claudiogodoy/gupers/payment-gateway/internal
             - github.com/jackc/pgx
+            - github.com/shopspring/decimal
         test:
           files:
             - $test

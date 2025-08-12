@@ -2,10 +2,11 @@ package internal
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
+	"math/big"
 	"time"
 )
 
@@ -52,10 +53,20 @@ func NewPaymentHandler(ctx context.Context,
 
 // PaymentRequest represents a payment processing request with amount, correlation ID, and timestamp.
 type PaymentRequest struct {
-	Amount        float64   `json:"amount"`
-	CorrelationID string    `json:"correlationId"`
-	RequestedAt   time.Time `json:"requestedAt"`
+	Amount        float64     `json:"amount"`
+	CorrelationID string      `json:"correlationId"`
+	RequestedAt   time.Time   `json:"requestedAt"`
+	TypeClient    PaymentType `json:"type,omitempty"`
 }
+
+// PaymentType identifies which processor handled the payment.
+type PaymentType int
+
+// PaymentTypeDefault indicates the default payment processor was used.
+const (
+	PaymentTypeDefault PaymentType = iota
+	PaymentTypeFallback
+)
 
 // ProcessPayment adds a payment request to the pending channel for processing.
 func (p *PaymentHandler) ProcessPayment(ctx context.Context, request *PaymentRequest) error {
@@ -70,8 +81,8 @@ func (p *PaymentHandler) ProcessPayment(ctx context.Context, request *PaymentReq
 		case p.pendingPaymentChan <- request:
 			return nil
 		case <-ticker.C:
-			p.logger.WarnContext(ctx, "taking too long to add request on channel",
-				slog.Int("channel_len", len(p.pendingPaymentChan)))
+			// p.logger.WarnContext(ctx, "taking too long to add request on channel",
+			// 	slog.Int("channel_len", len(p.pendingPaymentChan)))
 		case <-p.shutdown:
 			return nil
 		}
@@ -106,6 +117,12 @@ func (p *PaymentHandler) processPaymentWorker(ctx context.Context) {
 			routeClientAndSendRequest := func() error {
 				client := p.router.route()
 
+				if client == p.router.paymentProcessorClient {
+					request.TypeClient = PaymentTypeDefault
+				} else {
+					request.TypeClient = PaymentTypeFallback
+				}
+
 				p.logger.InfoContext(ctx, "Processing payment",
 					slog.String("correlationId", request.CorrelationID),
 					slog.Float64("amount", request.Amount))
@@ -115,6 +132,18 @@ func (p *PaymentHandler) processPaymentWorker(ctx context.Context) {
 			persistRequestInDatabase := func() error {
 				return p.sendToDB(ctx, request)
 			}
+
+			client := p.router.route()
+
+			if client == p.router.paymentProcessorClient {
+				request.TypeClient = PaymentTypeDefault
+			} else {
+				request.TypeClient = PaymentTypeFallback
+			}
+
+			p.logger.InfoContext(ctx, "Processing payment",
+				slog.String("correlationId", request.CorrelationID),
+				slog.Float64("amount", request.Amount))
 
 			// We must retry until the both func's are successfully done
 			retryEngine(routeClientAndSendRequest)
@@ -143,12 +172,12 @@ func (p *PaymentHandler) sendToDB(ctx context.Context, request *PaymentRequest) 
 
 func retryEngine(action func() error) {
 	const (
-		initialBackoff     = 10 * time.Millisecond
-		maxBackoff         = 5 * time.Second
-		maxRandomIncrement = 100
+		initialBackoff = 10   // 10 milliseconds
+		maxBackoff     = 5000 // 5 seconds
 	)
 
 	backoff := initialBackoff
+	bigBackoff := big.NewInt(int64(backoff))
 
 	for {
 		err := action()
@@ -156,12 +185,12 @@ func retryEngine(action func() error) {
 			return
 		}
 
-		//nolint: gosec
-		// Use of weak random number generator.
-		// See https://cwe.mitre.org/data/definitions/338.html.
-		// The issue is valid when using in security context.
-		randomIncrement := time.Duration(rand.IntN(maxRandomIncrement)) * time.Millisecond
-		time.Sleep(backoff + randomIncrement)
+		sleep, err := rand.Int(rand.Reader, bigBackoff)
+		if err != nil {
+			continue
+		}
+
+		time.Sleep(time.Duration(sleep.Int64()) * time.Millisecond)
 
 		if backoff < maxBackoff {
 			backoff *= 2
@@ -169,5 +198,7 @@ func retryEngine(action func() error) {
 				backoff = maxBackoff
 			}
 		}
+
+		bigBackoff.SetInt64(int64(backoff))
 	}
 }

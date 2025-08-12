@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net/http"
@@ -23,7 +24,7 @@ const (
 	httpClientTimeout  = 30
 	serverReadTimeout  = 15
 	serverWriteTimeout = 15
-	serverIdleTimeout  = 60
+	serverIdleTimeout  = 120
 	shutdownTimeout    = 30
 
 	defaultChannelLen = 1000
@@ -110,12 +111,29 @@ func loadConfiguration() configuration {
 }
 
 func createHTTPClients() httpClients {
+	const (
+		MaxIdleConns        = 1024
+		MaxIdleConnsPerHost = 256
+		IdleConnTimeout     = 90 * time.Second
+	)
+
+	trConfig := &http.Transport{
+		MaxIdleConns:        MaxIdleConns,
+		MaxIdleConnsPerHost: MaxIdleConnsPerHost,
+		MaxConnsPerHost:     0,
+		IdleConnTimeout:     IdleConnTimeout,
+		DisableKeepAlives:   false,
+		ForceAttemptHTTP2:   true,
+	}
+
 	return httpClients{
 		primary: &http.Client{
-			Timeout: httpClientTimeout * time.Second,
+			Timeout:   httpClientTimeout * time.Second,
+			Transport: trConfig,
 		},
 		fallback: &http.Client{
-			Timeout: httpClientTimeout * time.Second,
+			Timeout:   httpClientTimeout * time.Second,
+			Transport: trConfig,
 		},
 	}
 }
@@ -168,6 +186,7 @@ func NewServer() *Server { // function length acceptable due to setup logic
 	port := getEnvDefault("PORT", "8080")
 	dbURL := mustGetEnv("DATABASE_URL")
 	logger := newLogger()
+
 	dbClient := internal.NewPostgresDBClient(ctx, dbURL)
 	config := loadConfiguration()
 	logConfiguration(ctx, logger, config)
@@ -186,7 +205,14 @@ func NewServer() *Server { // function length acceptable due to setup logic
 	return &Server{port: port, mux: mux, server: server, handler: paymentHandler, logger: logger}
 }
 
-func newLogger() *slog.Logger { return slog.New(slog.NewTextHandler(os.Stdout, nil)) }
+func newLogger() *slog.Logger {
+	var levelVar slog.LevelVar
+	levelVar.Set(slog.LevelError)
+
+	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: &levelVar,
+	}))
+}
 
 func getEnvDefault(key, def string) string {
 	val := os.Getenv(key)
@@ -272,15 +298,26 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) paymentsHandler(writer http.ResponseWriter, request *http.Request) { // route handler
+func (s *Server) paymentsHandler(writer http.ResponseWriter, request *http.Request) {
+	ctx := request.Context()
+
+	defer func() {
+		_, copyErr := io.Copy(io.Discard, request.Body)
+		if copyErr != nil {
+			s.logger.WarnContext(ctx, "drain response body failed", "err", copyErr)
+		}
+
+		err := request.Body.Close()
+		if err != nil {
+			s.logger.ErrorContext(ctx, "Failed to close request body", slog.String("error", err.Error()))
+		}
+	}()
+
 	if request.Method != http.MethodPost {
 		http.Error(writer, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 
 		return
 	}
-
-	ctx := request.Context()
-	s.logger.DebugContext(ctx, "Payment request received")
 
 	var req internal.PaymentRequest
 
@@ -302,7 +339,8 @@ func (s *Server) paymentsHandler(writer http.ResponseWriter, request *http.Reque
 		return
 	}
 
-	s.respondJSON(ctx, writer, http.StatusOK, map[string]string{"status": "processed"})
+	writer.Header().Set("Content-Type", "application/json")
+	writer.Header().Set("Content-Length", "0")
 }
 
 func (s *Server) setupRoutes() {
@@ -324,23 +362,23 @@ func (s *Server) paymentsSummaryHandler(writer http.ResponseWriter, request *htt
 		return
 	}
 
-	summaries, err := s.handler.GetPaymentsSummary(request.Context(), fromTime, toTime)
+	ctx := request.Context()
+
+	defer func() {
+		_, copyErr := io.Copy(io.Discard, request.Body)
+		if copyErr != nil {
+			s.logger.WarnContext(ctx, "drain response body failed", "err", copyErr)
+		}
+
+		err := request.Body.Close()
+		if err != nil {
+			s.logger.ErrorContext(ctx, fmt.Sprintf("error on defer %v", err))
+		}
+	}()
+
+	summaries, err := s.handler.GetPaymentsSummary(ctx, fromTime, toTime)
 	if err != nil {
-		s.logger.ErrorContext(request.Context(), "Failed to read payments summary", slog.String("error", err.Error()))
-		http.Error(writer, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-
-		return
-	}
-
-	defaultAmount, okDefault := summaries[0].TotalAmount.Float64()
-	if !okDefault {
-		http.Error(writer, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-
-		return
-	}
-
-	fallbackAmount, okFallback := summaries[1].TotalAmount.Float64()
-	if !okFallback {
+		s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to read payments summary, %v", err))
 		http.Error(writer, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 
 		return
@@ -349,15 +387,28 @@ func (s *Server) paymentsSummaryHandler(writer http.ResponseWriter, request *htt
 	resp := map[string]any{
 		"default": map[string]any{
 			"totalRequests": summaries[0].TotalRequests,
-			"totalAmount":   defaultAmount,
+			"totalAmount":   summaries[0].TotalAmount,
 		},
 		"fallback": map[string]any{
 			"totalRequests": summaries[1].TotalRequests,
-			"totalAmount":   fallbackAmount,
+			"totalAmount":   summaries[1].TotalAmount,
 		},
 	}
 
-	s.respondJSON(request.Context(), writer, http.StatusOK, resp)
+	writer.Header().Set("Content-Type", "application/json")
+	writer.Header().Set("Content-Length", "0")
+
+	bResp, err := json.Marshal(resp)
+	if err != nil {
+		s.errorJSON(ctx, writer, http.StatusInternalServerError, "encode error", "marshal resp failed")
+
+		return
+	}
+
+	writer.Header().Set("Content-Type", "application/json")
+	writer.Header().Set("Content-Length", strconv.Itoa(len(bResp))) // correct length
+	writer.WriteHeader(http.StatusOK)
+	_, _ = writer.Write(bResp)
 }
 
 func parseTimeRange(fromStr, toStr string) (time.Time, time.Time, error) {

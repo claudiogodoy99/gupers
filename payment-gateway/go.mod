@@ -5,6 +5,7 @@ go 1.24.5
 require (
 	github.com/jackc/pgx/v5 v5.7.5
 	github.com/shopspring/decimal v1.4.0
+	github.com/jackc/pgx-shopspring-decimal v0.0.0-20220624020537-1d36b5a1853e 
 )
 
 require (

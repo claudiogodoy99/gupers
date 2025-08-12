@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"sync/atomic"
@@ -87,6 +88,7 @@ func (c *PaymentClient) processPayment(ctx context.Context, request *PaymentRequ
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.ContentLength = int64(len(jsonData))
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -96,6 +98,11 @@ func (c *PaymentClient) processPayment(ctx context.Context, request *PaymentRequ
 	}
 
 	defer func() {
+		_, copyErr := io.Copy(io.Discard, resp.Body)
+		if copyErr != nil {
+			c.serverLogger.WarnContext(ctx, "drain response body failed", "err", copyErr)
+		}
+
 		closeErr := resp.Body.Close()
 		if closeErr != nil {
 			c.serverLogger.ErrorContext(ctx, fmt.Sprintf("failed to close response body: %v", closeErr))
