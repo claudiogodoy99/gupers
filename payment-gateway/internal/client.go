@@ -91,6 +91,7 @@ func (c *PaymentClient) processPayment(ctx context.Context, request *PaymentRequ
 	req.ContentLength = int64(len(jsonData))
 
 	resp, err := c.httpClient.Do(req)
+
 	if err != nil {
 		c.serverLogger.ErrorContext(ctx, fmt.Sprintf("failed to send payment request: %v", err))
 
@@ -98,16 +99,16 @@ func (c *PaymentClient) processPayment(ctx context.Context, request *PaymentRequ
 	}
 
 	defer func() {
-		_, copyErr := io.Copy(io.Discard, resp.Body)
-		if copyErr != nil {
-			c.serverLogger.WarnContext(ctx, "drain response body failed", "err", copyErr)
-		}
-
 		closeErr := resp.Body.Close()
 		if closeErr != nil {
 			c.serverLogger.ErrorContext(ctx, fmt.Sprintf("failed to close response body: %v", closeErr))
 		}
 	}()
+
+	_, err = io.ReadAll(resp.Body)
+	if err != nil {
+		c.serverLogger.WarnContext(ctx, fmt.Sprintf("failed to read body: %v", err))
+	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("%w: %d", ErrPaymentProcessorStatus, resp.StatusCode)
