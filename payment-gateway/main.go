@@ -302,11 +302,6 @@ func (s *Server) paymentsHandler(writer http.ResponseWriter, request *http.Reque
 	ctx := request.Context()
 
 	defer func() {
-		_, copyErr := io.Copy(io.Discard, request.Body)
-		if copyErr != nil {
-			s.logger.WarnContext(ctx, "drain response body failed", "err", copyErr)
-		}
-
 		err := request.Body.Close()
 		if err != nil {
 			s.logger.ErrorContext(ctx, "Failed to close request body", slog.String("error", err.Error()))
@@ -339,7 +334,6 @@ func (s *Server) paymentsHandler(writer http.ResponseWriter, request *http.Reque
 		return
 	}
 
-	writer.Header().Set("Content-Type", "application/json")
 	writer.Header().Set("Content-Length", "0")
 }
 
@@ -349,6 +343,8 @@ func (s *Server) setupRoutes() {
 }
 
 func (s *Server) paymentsSummaryHandler(writer http.ResponseWriter, request *http.Request) { // route handler
+	ctx := request.Context()
+
 	if request.Method != http.MethodGet {
 		http.Error(writer, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 
@@ -362,14 +358,12 @@ func (s *Server) paymentsSummaryHandler(writer http.ResponseWriter, request *htt
 		return
 	}
 
-	ctx := request.Context()
+	_, err = io.ReadAll(request.Body)
+	if err != nil {
+		s.logger.WarnContext(ctx, fmt.Sprintf("io.ReadAll err %v", err))
+	}
 
 	defer func() {
-		_, copyErr := io.Copy(io.Discard, request.Body)
-		if copyErr != nil {
-			s.logger.WarnContext(ctx, "drain response body failed", "err", copyErr)
-		}
-
 		err := request.Body.Close()
 		if err != nil {
 			s.logger.ErrorContext(ctx, fmt.Sprintf("error on defer %v", err))
@@ -395,9 +389,6 @@ func (s *Server) paymentsSummaryHandler(writer http.ResponseWriter, request *htt
 		},
 	}
 
-	writer.Header().Set("Content-Type", "application/json")
-	writer.Header().Set("Content-Length", "0")
-
 	bResp, err := json.Marshal(resp)
 	if err != nil {
 		s.errorJSON(ctx, writer, http.StatusInternalServerError, "encode error", "marshal resp failed")
@@ -406,7 +397,7 @@ func (s *Server) paymentsSummaryHandler(writer http.ResponseWriter, request *htt
 	}
 
 	writer.Header().Set("Content-Type", "application/json")
-	writer.Header().Set("Content-Length", strconv.Itoa(len(bResp))) // correct length
+	writer.Header().Set("Content-Length", strconv.Itoa(len(bResp)))
 	writer.WriteHeader(http.StatusOK)
 	_, _ = writer.Write(bResp)
 }
