@@ -2,16 +2,16 @@
 package internal
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"sync/atomic"
 	"time"
+
+	"github.com/valyala/fasthttp"
 )
 
 const (
@@ -31,27 +31,28 @@ type ServicesAvailabilityWireResponse struct {
 
 // PaymentClient is a client for the payment gateway.
 type PaymentClient struct {
-	httpClient   *http.Client
-	count        atomic.Int64
-	health       atomic.Bool
-	shutdown     chan struct{}
-	serverLogger *slog.Logger
-
-	url            string
-	healthCheckURL string
+	httpClient            *fasthttp.Client
+	count                 atomic.Int64
+	health                atomic.Bool
+	shutdown              chan struct{}
+	serverLogger          *slog.Logger
+	headerContentTypeJSON []byte
+	url                   string
+	healthCheckURL        string
 }
 
 // NewPaymentClient creates a new PaymentClient instance for interacting with the payment gateway.
 func NewPaymentClient(ctx context.Context,
-	httpClient *http.Client, url, healthCheckURL string,
+	httpClient *fasthttp.Client, url, healthCheckURL string,
 	logger *slog.Logger,
 ) *PaymentClient {
 	client := &PaymentClient{
-		httpClient:     httpClient,
-		shutdown:       make(chan struct{}),
-		url:            url,
-		healthCheckURL: healthCheckURL,
-		serverLogger:   logger,
+		httpClient:            httpClient,
+		shutdown:              make(chan struct{}),
+		url:                   url,
+		healthCheckURL:        healthCheckURL,
+		headerContentTypeJSON: []byte("application/json"),
+		serverLogger:          logger,
 	}
 
 	go client.monitorClient(ctx)
@@ -82,36 +83,28 @@ func (c *PaymentClient) processPayment(ctx context.Context, request *PaymentRequ
 		return fmt.Errorf("failed to marshal payment request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
+	req := fasthttp.AcquireRequest()
+	req.SetRequestURI(c.url)
+	req.Header.SetMethod(fasthttp.MethodPost)
+	req.Header.SetContentTypeBytes(c.headerContentTypeJSON)
+	req.SetBodyRaw(jsonData)
 
-	req.Header.Set("Content-Type", "application/json")
-	req.ContentLength = int64(len(jsonData))
+	resp := fasthttp.AcquireResponse()
+	err = c.httpClient.Do(req, resp)
 
-	resp, err := c.httpClient.Do(req)
+	fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
 
 	if err != nil {
 		c.serverLogger.ErrorContext(ctx, fmt.Sprintf("failed to send payment request: %v", err))
 
-		return fmt.Errorf("failed to send payment request: %w", err)
+		return ErrPaymentProcessorStatus
 	}
 
-	defer func() {
-		closeErr := resp.Body.Close()
-		if closeErr != nil {
-			c.serverLogger.ErrorContext(ctx, fmt.Sprintf("failed to close response body: %v", closeErr))
-		}
-	}()
+	stat := resp.StatusCode()
 
-	_, err = io.ReadAll(resp.Body)
-	if err != nil {
-		c.serverLogger.WarnContext(ctx, fmt.Sprintf("failed to read body: %v", err))
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("%w: %d", ErrPaymentProcessorStatus, resp.StatusCode)
+	if stat < 200 || stat >= 300 {
+		return ErrPaymentProcessorStatus
 	}
 
 	return nil
@@ -142,39 +135,40 @@ func (c *PaymentClient) update(available bool) {
 func (c *PaymentClient) performHealthCheck(ctx context.Context) {
 	c.serverLogger.DebugContext(ctx, "health checking endpoint: "+c.healthCheckURL)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.healthCheckURL, nil)
+	req := fasthttp.AcquireRequest()
+	req.SetRequestURI(c.healthCheckURL)
+	req.Header.SetMethod(fasthttp.MethodGet)
+
+	resp := fasthttp.AcquireResponse()
+	err := c.httpClient.Do(req, resp)
+
+	fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
 	if err != nil {
-		c.serverLogger.ErrorContext(ctx, fmt.Sprintf("failed to create health check request: %v", err))
 		c.update(false)
 
 		return
 	}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		c.serverLogger.ErrorContext(ctx, "endpoint "+c.healthCheckURL+" unavailable")
+	statusCode := resp.StatusCode()
+
+	if statusCode != http.StatusOK {
 		c.update(false)
 
 		return
 	}
 
-	defer func() {
-		closeErr := resp.Body.Close()
-		if closeErr != nil {
-			c.serverLogger.ErrorContext(ctx, fmt.Sprintf("failed to close response body: %v", closeErr))
-		}
-	}()
+	respBody := resp.Body()
 
-	if resp.StatusCode != http.StatusOK {
-		c.serverLogger.ErrorContext(ctx, "endpoint "+c.healthCheckURL+" unavailable")
-
-		return
+	healthResp := &ServicesAvailabilityWireResponse{
+		Failing: false,
 	}
 
-	var healthResp ServicesAvailabilityWireResponse
-
-	err = json.NewDecoder(resp.Body).Decode(&healthResp)
+	err = json.Unmarshal(respBody, healthResp)
 	if err != nil {
+		c.update(false)
+
 		return
 	}
 
@@ -182,8 +176,7 @@ func (c *PaymentClient) performHealthCheck(ctx context.Context) {
 
 	c.serverLogger.DebugContext(ctx, "health-check completed",
 		slog.String("endpoint", c.healthCheckURL),
-		slog.Bool("available", available),
-		slog.Int("response_time_ms", healthResp.MinResponseTime))
+		slog.Bool("available", available))
 
 	c.update(available)
 }

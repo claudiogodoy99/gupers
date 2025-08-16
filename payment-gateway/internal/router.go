@@ -5,12 +5,12 @@ type Router struct {
 	paymentProcessorClient         *PaymentClient
 	paymentProcessorFallbackClient *PaymentClient
 	threshold                      int
-	pendingPaymentChan             chan *PaymentRequest
+	pendingPaymentChan             chan []byte
 	bufSize                        int
 }
 
 // NewRouter creates a new Router instance.
-func NewRouter(threshold, bufSize int, pendingPaymentChan chan *PaymentRequest,
+func NewRouter(threshold, bufSize int, pendingPaymentChan chan []byte,
 	paymentProcessorClient, paymentProcessorFallbackClient *PaymentClient,
 ) *Router {
 	return &Router{

@@ -1,13 +1,17 @@
 package internal
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
 	"time"
+
+	decimal "github.com/shopspring/decimal"
 )
 
 const (
@@ -22,7 +26,7 @@ var ErrDBClientUnavailable = errors.New("database client not available")
 type PaymentHandler struct {
 	router             *Router
 	logger             *slog.Logger
-	pendingPaymentChan chan *PaymentRequest
+	pendingPaymentChan chan []byte
 	shutdown           chan struct{}
 	dbClient           DBClient
 }
@@ -32,7 +36,7 @@ type PaymentHandler struct {
 func NewPaymentHandler(ctx context.Context,
 	router *Router,
 	numWorkers int,
-	pendingChan chan *PaymentRequest,
+	pendingChan chan []byte,
 	logger *slog.Logger,
 	dbClient DBClient,
 ) *PaymentHandler {
@@ -53,10 +57,10 @@ func NewPaymentHandler(ctx context.Context,
 
 // PaymentRequest represents a payment processing request with amount, correlation ID, and timestamp.
 type PaymentRequest struct {
-	Amount        float64     `json:"amount"`
-	CorrelationID string      `json:"correlationId"`
-	RequestedAt   time.Time   `json:"requestedAt"`
-	TypeClient    PaymentType `json:"type,omitempty"`
+	Amount        decimal.Decimal `json:"amount"`
+	CorrelationID string          `json:"correlationId"`
+	RequestedAt   time.Time       `json:"requestedAt"`
+	TypeClient    PaymentType     `json:"type,omitempty"`
 }
 
 // PaymentType identifies which processor handled the payment.
@@ -69,7 +73,7 @@ const (
 )
 
 // ProcessPayment adds a payment request to the pending channel for processing.
-func (p *PaymentHandler) ProcessPayment(ctx context.Context, request *PaymentRequest) error {
+func (p *PaymentHandler) ProcessPayment(ctx context.Context, request []byte) error {
 	p.logger.DebugContext(ctx, "received request, adding into channel",
 		slog.Int("channel_len", len(p.pendingPaymentChan)))
 
@@ -113,7 +117,14 @@ func (p *PaymentHandler) Shutdown() {
 func (p *PaymentHandler) processPaymentWorker(ctx context.Context) {
 	for {
 		select {
-		case request := <-p.pendingPaymentChan:
+		case data := <-p.pendingPaymentChan:
+			var request *PaymentRequest
+
+			err := json.NewDecoder(bytes.NewReader(data)).Decode(&request)
+			if err != nil {
+				p.logger.ErrorContext(ctx, fmt.Sprintf("error decoding json body %v", err))
+			}
+
 			routeClientAndSendRequest := func() error {
 				client := p.router.route()
 
@@ -125,25 +136,13 @@ func (p *PaymentHandler) processPaymentWorker(ctx context.Context) {
 
 				p.logger.InfoContext(ctx, "Processing payment",
 					slog.String("correlationId", request.CorrelationID),
-					slog.Float64("amount", request.Amount))
+					slog.String("amount", request.Amount.String()))
 
 				return client.processPayment(ctx, request)
 			}
 			persistRequestInDatabase := func() error {
 				return p.sendToDB(ctx, request)
 			}
-
-			client := p.router.route()
-
-			if client == p.router.paymentProcessorClient {
-				request.TypeClient = PaymentTypeDefault
-			} else {
-				request.TypeClient = PaymentTypeFallback
-			}
-
-			p.logger.InfoContext(ctx, "Processing payment",
-				slog.String("correlationId", request.CorrelationID),
-				slog.Float64("amount", request.Amount))
 
 			// We must retry until the both func's are successfully done
 			retryEngine(routeClientAndSendRequest)

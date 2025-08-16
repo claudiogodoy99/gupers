@@ -5,19 +5,23 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"log"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"syscall"
 	"time"
 
+	_ "net/http/pprof"
+
+	"runtime/metrics"
+
 	"github.com/claudiogodoy/gupers/payment-gateway/internal"
+	"github.com/valyala/fasthttp"
 )
 
 const (
@@ -34,8 +38,6 @@ const (
 
 type Server struct {
 	port    string
-	mux     *http.ServeMux
-	server  *http.Server
 	handler *internal.PaymentHandler
 	logger  *slog.Logger
 }
@@ -110,42 +112,29 @@ func loadConfiguration() configuration {
 	}
 }
 
-func createHTTPClients() httpClients {
-	const (
-		MaxIdleConns        = 1024
-		MaxIdleConnsPerHost = 256
-		IdleConnTimeout     = 90 * time.Second
-	)
-
-	trConfig := &http.Transport{
-		MaxIdleConns:        MaxIdleConns,
-		MaxIdleConnsPerHost: MaxIdleConnsPerHost,
-		MaxConnsPerHost:     0,
-		IdleConnTimeout:     IdleConnTimeout,
-		DisableKeepAlives:   false,
-		ForceAttemptHTTP2:   true,
-	}
-
-	return httpClients{
-		primary: &http.Client{
-			Timeout:   httpClientTimeout * time.Second,
-			Transport: trConfig,
-		},
-		fallback: &http.Client{
-			Timeout:   httpClientTimeout * time.Second,
-			Transport: trConfig,
-		},
-	}
-}
-
 func createPaymentClients(ctx context.Context,
-	clients httpClients,
 	config configuration,
 	logger *slog.Logger,
 ) paymentClients {
+	readTimeout, _ := time.ParseDuration("500ms")
+	writeTimeout, _ := time.ParseDuration("5s")
+	maxIdleConnDuration, _ := time.ParseDuration("1h")
+
+	client := &fasthttp.Client{
+		ReadTimeout:                   readTimeout,
+		WriteTimeout:                  writeTimeout,
+		MaxIdleConnDuration:           maxIdleConnDuration,
+		NoDefaultUserAgentHeader:      true,
+		DisableHeaderNamesNormalizing: true,
+		DisablePathNormalizing:        true,
+		Dial: (&fasthttp.TCPDialer{
+			Concurrency:      4096,
+			DNSCacheDuration: time.Hour,
+		}).Dial,
+	}
 	return paymentClients{
-		primary:  internal.NewPaymentClient(ctx, clients.primary, config.primaryURL, config.primaryHealthURL, logger),
-		fallback: internal.NewPaymentClient(ctx, clients.fallback, config.fallbackURL, config.fallbackHealthURL, logger),
+		primary:  internal.NewPaymentClient(ctx, client, config.primaryURL, config.primaryHealthURL, logger),
+		fallback: internal.NewPaymentClient(ctx, client, config.fallbackURL, config.fallbackHealthURL, logger),
 	}
 }
 
@@ -191,18 +180,9 @@ func NewServer() *Server { // function length acceptable due to setup logic
 	config := loadConfiguration()
 	logConfiguration(ctx, logger, config)
 
-	mux := http.NewServeMux()
 	paymentHandler := buildPaymentHandler(ctx, config, logger, dbClient)
 
-	server := &http.Server{
-		Addr:         ":" + port,
-		Handler:      mux,
-		ReadTimeout:  serverReadTimeout * time.Second,
-		WriteTimeout: serverWriteTimeout * time.Second,
-		IdleTimeout:  serverIdleTimeout * time.Second,
-	}
-
-	return &Server{port: port, mux: mux, server: server, handler: paymentHandler, logger: logger}
+	return &Server{port: port, handler: paymentHandler, logger: logger}
 }
 
 func newLogger() *slog.Logger {
@@ -247,8 +227,7 @@ func buildPaymentHandler(
 	logger *slog.Logger,
 	dbClient internal.DBClient,
 ) *internal.PaymentHandler {
-	clients := createHTTPClients()
-	paymentClients := createPaymentClients(ctx, clients, cfg, logger)
+	paymentClients := createPaymentClients(ctx, cfg, logger)
 	workerConf := loadWorkerConfiguration(ctx, logger)
 
 	logger.InfoContext(ctx, "Payment handler configuration",
@@ -256,7 +235,7 @@ func buildPaymentHandler(
 		slog.Int("num_workers", workerConf.numWorkers),
 	)
 
-	channel := make(chan *internal.PaymentRequest, workerConf.channelLen)
+	channel := make(chan []byte, workerConf.channelLen)
 	router := internal.NewRouter(
 		cfg.routerThreshold,
 		workerConf.channelLen,
@@ -268,112 +247,148 @@ func buildPaymentHandler(
 	return internal.NewPaymentHandler(ctx, router, workerConf.numWorkers, channel, logger, dbClient)
 }
 
-func (s *Server) Start() error {
-	s.setupRoutes()
-
-	ctx := context.Background()
-	s.logger.InfoContext(ctx, "Starting server",
-		slog.String("port", s.port),
-		slog.String("health_endpoint", "http://localhost:"+s.port+"/health"),
-		slog.String("payments_endpoint", "http://localhost:"+s.port+"/payments"),
-	)
-
-	err := s.server.ListenAndServe()
-	if err != nil {
-		return fmt.Errorf("failed to start server: %w", err)
-	}
-
-	return nil
-}
-
-func (s *Server) Shutdown(ctx context.Context) error {
+func (s *Server) Shutdown(ctx context.Context) {
 	s.logger.InfoContext(ctx, "Shutting down server gracefully")
 	s.handler.Shutdown()
-
-	err := s.server.Shutdown(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to shutdown server: %w", err)
-	}
-
-	return nil
 }
 
-func (s *Server) paymentsHandler(writer http.ResponseWriter, request *http.Request) {
-	ctx := request.Context()
+func main() {
+	ctx := context.Background()
 
-	defer func() {
-		err := request.Body.Close()
+	server := NewServer()
+
+	server.logger.InfoContext(ctx, "Starting server",
+		slog.String("port", server.port),
+		slog.String("health_endpoint", "http://localhost:"+server.port+"/health"),
+		slog.String("payments_endpoint", "http://localhost:"+server.port+"/payments"),
+	)
+
+	go readMetrics()
+
+	signalChannel := make(chan os.Signal, 1)
+	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		err := fasthttp.ListenAndServe(":"+server.port, server.HandlerFunc)
 		if err != nil {
-			s.logger.ErrorContext(ctx, "Failed to close request body", slog.String("error", err.Error()))
+			panic(err)
 		}
 	}()
 
-	if request.Method != http.MethodPost {
-		http.Error(writer, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+	go func() {
+		err := http.ListenAndServe(":6060", nil)
+		if err != nil {
+			panic(err)
+		}
+	}()
+
+	<-signalChannel
+	server.logger.InfoContext(ctx, "Stopping server")
+
+	server.Shutdown(ctx)
+}
+
+func readMetrics() {
+	interval := 2 * time.Second
+
+	descs := metrics.All()
+	// Prepare stable, sorted order for display.
+	names := make([]string, 0, len(descs))
+	for _, d := range descs {
+		names = append(names, d.Name)
+	}
+	sort.Strings(names)
+
+	// Prebuild sample slice once (no per-tick allocs).
+	samples := make([]metrics.Sample, len(names))
+	for i, n := range names {
+		samples[i].Name = n
+	}
+
+	var lastLines int
+
+	for {
+		metrics.Read(samples)
+
+		// Build table lines.
+		lines := make([]string, 0, len(samples)+3)
+		header := fmt.Sprintf("Go runtime/metrics — %s", time.Now().Format(time.RFC3339))
+		sep := repeat('-', 80)
+		lines = append(lines, header, sep)
+		lines = append(lines, fmt.Sprintf("%-64s | %s", "KEY", "VALUE"))
+		lines = append(lines, sep)
+
+		for _, s := range samples {
+			val := formatSampleValue(s)
+			lines = append(lines, fmt.Sprintf("%-64s | %s", s.Name, val))
+		}
+
+		// --- Overwrite previous frame (move cursor up + clear) ---
+		// Move the cursor up by the number of lines printed last time.
+		if lastLines > 0 {
+			fmt.Printf("\x1b[%dA", lastLines) // cursor up N lines
+			fmt.Printf("\x1b[J")              // clear from cursor to end of screen
+		}
+
+		// Print current frame.
+		for _, ln := range lines {
+			fmt.Printf("%s\n", ln)
+		}
+		lastLines = len(lines)
+
+		time.Sleep(interval)
+	}
+}
+
+func (s *Server) HandlerFunc(ctx *fasthttp.RequestCtx) {
+	switch string(ctx.Path()) {
+	case "/payments":
+		s.paymentsHandler(ctx)
+	case "/payments-summary":
+		s.paymentsSummaryHandler(ctx)
+	default:
+		ctx.Error("not found", fasthttp.StatusNotFound)
+	}
+}
+
+func (s *Server) paymentsHandler(ctx *fasthttp.RequestCtx) {
+	if !ctx.IsPost() {
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
 
 		return
 	}
 
-	var req internal.PaymentRequest
+	byteBody := []byte(nil)
+	byteBody = append(byteBody, ctx.PostBody()...)
 
-	decodeErr := json.NewDecoder(request.Body).Decode(&req)
-	if decodeErr != nil {
-		s.errorJSON(ctx, writer, http.StatusBadRequest, "Invalid request body", "Failed to decode JSON request")
-
-		return
-	}
-
-	if req.RequestedAt.IsZero() {
-		req.RequestedAt = time.Now().UTC()
-	}
-
-	processErr := s.handler.ProcessPayment(ctx, &req)
+	processErr := s.handler.ProcessPayment(ctx, byteBody)
 	if processErr != nil {
-		s.errorJSON(ctx, writer, http.StatusInternalServerError, "Failed to process payment", "Payment processing failed")
+		ctx.SetStatusCode(http.StatusInternalServerError)
 
 		return
 	}
 
-	writer.Header().Set("Content-Length", "0")
+	ctx.SetStatusCode(http.StatusOK)
 }
 
-func (s *Server) setupRoutes() {
-	s.mux.HandleFunc("/payments", s.paymentsHandler)
-	s.mux.HandleFunc("/payments-summary", s.paymentsSummaryHandler)
-}
-
-func (s *Server) paymentsSummaryHandler(writer http.ResponseWriter, request *http.Request) { // route handler
-	ctx := request.Context()
-
-	if request.Method != http.MethodGet {
-		http.Error(writer, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+func (s *Server) paymentsSummaryHandler(ctx *fasthttp.RequestCtx) {
+	if !ctx.IsGet() {
+		ctx.SetStatusCode(http.StatusNotFound)
 
 		return
 	}
 
-	fromTime, toTime, err := parseTimeRange(request.URL.Query().Get("from"), request.URL.Query().Get("to"))
+	fromTime, toTime, err := parseTimeRange(string(ctx.FormValue("from")), string(ctx.FormValue("to")))
 	if err != nil {
-		http.Error(writer, err.Error(), http.StatusBadRequest)
+		ctx.SetStatusCode(http.StatusBadRequest)
 
 		return
 	}
-
-	_, err = io.ReadAll(request.Body)
-	if err != nil {
-		s.logger.WarnContext(ctx, fmt.Sprintf("io.ReadAll err %v", err))
-	}
-
-	defer func() {
-		err := request.Body.Close()
-		if err != nil {
-			s.logger.ErrorContext(ctx, fmt.Sprintf("error on defer %v", err))
-		}
-	}()
 
 	summaries, err := s.handler.GetPaymentsSummary(ctx, fromTime, toTime)
 	if err != nil {
 		s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to read payments summary, %v", err))
-		http.Error(writer, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		ctx.SetStatusCode(http.StatusInternalServerError)
 
 		return
 	}
@@ -391,15 +406,16 @@ func (s *Server) paymentsSummaryHandler(writer http.ResponseWriter, request *htt
 
 	bResp, err := json.Marshal(resp)
 	if err != nil {
-		s.errorJSON(ctx, writer, http.StatusInternalServerError, "encode error", "marshal resp failed")
+		s.logger.ErrorContext(ctx, fmt.Sprintf("Failed to convert body, %v", err))
+		ctx.SetStatusCode(http.StatusInternalServerError)
 
 		return
 	}
 
-	writer.Header().Set("Content-Type", "application/json")
-	writer.Header().Set("Content-Length", strconv.Itoa(len(bResp)))
-	writer.WriteHeader(http.StatusOK)
-	_, _ = writer.Write(bResp)
+	ctx.SetStatusCode(http.StatusOK)
+	ctx.SetContentType("application-json")
+	ctx.Request.Header.SetContentLength(len(bResp))
+	ctx.SetBody(bResp)
 }
 
 func parseTimeRange(fromStr, toStr string) (time.Time, time.Time, error) {
@@ -426,48 +442,75 @@ func parseTimeRange(fromStr, toStr string) (time.Time, time.Time, error) {
 	return from, toTime, nil
 }
 
-func (s *Server) respondJSON(ctx context.Context, writer http.ResponseWriter, status int, payload any) {
-	writer.Header().Set("Content-Type", "application/json")
-	writer.WriteHeader(status)
-
-	encodeErr := json.NewEncoder(writer).Encode(payload)
-	if encodeErr != nil {
-		s.logger.ErrorContext(ctx, "Failed to encode JSON response", slog.String("error", encodeErr.Error()))
-	}
-}
-
-func (s *Server) errorJSON(ctx context.Context, writer http.ResponseWriter, status int, errTitle, message string) {
-	s.respondJSON(ctx, writer, status, ErrorResponse{Error: errTitle, Message: message})
-}
-
-func main() {
-	ctx := context.Background()
-	server := NewServer()
-
-	signalChannel := make(chan os.Signal, 1)
-	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
-
-	go func() {
-		err := server.Start()
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			panic("Server failed to start")
+func formatSampleValue(s metrics.Sample) string {
+	switch s.Value.Kind() {
+	case metrics.KindUint64:
+		return fmt.Sprintf("%d", s.Value.Uint64())
+	case metrics.KindFloat64:
+		return fmt.Sprintf("%.6g", s.Value.Float64())
+	case metrics.KindFloat64Histogram:
+		h := s.Value.Float64Histogram()
+		total := uint64(0)
+		for _, c := range h.Counts {
+			total += c
 		}
-	}()
-
-	server.logger.InfoContext(ctx, "Server started successfully. Press Ctrl+C to shutdown.")
-
-	<-signalChannel
-
-	server.logger.InfoContext(ctx, "Shutdown signal received")
-
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout*time.Second)
-	defer cancel()
-
-	err := server.Shutdown(ctx)
-	if err != nil {
-		server.logger.ErrorContext(ctx, fmt.Sprintf("Error during shutdown: %v", err))
+		// Compact summary (you can change which quantiles to show)
+		p50 := histQuantile(h, 0.50)
+		p90 := histQuantile(h, 0.90)
+		p99 := histQuantile(h, 0.99)
+		return fmt.Sprintf("count=%d p50=%.6g p90=%.6g p99=%.6g", total, p50, p90, p99)
+	default:
+		return "<unknown>"
 	}
+}
 
-	<-ctx.Done()
-	server.logger.InfoContext(ctx, "Shutdown completed")
+func histQuantile(h *metrics.Float64Histogram, q float64) float64 {
+	if h == nil || len(h.Counts) == 0 {
+		return 0
+	}
+	var total uint64
+	for _, c := range h.Counts {
+		total += c
+	}
+	if total == 0 {
+		return 0
+	}
+	target := uint64(float64(total-1) * q)
+
+	var cum uint64
+	for i, c := range h.Counts {
+		if c == 0 {
+			continue
+		}
+		next := cum + c
+		if target < next {
+			var lo, hi float64
+			if i == 0 {
+				// For -Inf bucket, just anchor to first bound distance.
+				lo = h.Buckets[0] - 1
+			} else {
+				lo = h.Buckets[i-1]
+			}
+			if i == len(h.Buckets) {
+				hi = h.Buckets[len(h.Buckets)-1] + 1
+			} else {
+				hi = h.Buckets[i]
+			}
+			inBucket := float64(target-cum) / float64(c)
+			return lo + (hi-lo)*inBucket
+		}
+		cum = next
+	}
+	if len(h.Buckets) > 0 {
+		return h.Buckets[len(h.Buckets)-1]
+	}
+	return 0
+}
+
+func repeat(ch rune, n int) string {
+	b := make([]rune, n)
+	for i := range b {
+		b[i] = ch
+	}
+	return string(b)
 }
