@@ -9,16 +9,15 @@ import (
 	"log"
 	"log/slog"
 	"net/http"
+
+	// "net/http"
 	"os"
 	"os/signal"
-	"sort"
 	"strconv"
 	"syscall"
 	"time"
 
-	_ "net/http/pprof"
-
-	"runtime/metrics"
+	// _ "net/http/pprof"
 
 	"github.com/claudiogodoy/gupers/payment-gateway/internal"
 	"github.com/valyala/fasthttp"
@@ -235,16 +234,21 @@ func buildPaymentHandler(
 		slog.Int("num_workers", workerConf.numWorkers),
 	)
 
-	channel := make(chan []byte, workerConf.channelLen)
+	channelSlice := [4]chan []byte{}
+	perSlice := workerConf.channelLen / 4
+	for i := range 4 {
+		channelSlice[i] = make(chan []byte, perSlice)
+	}
+
 	router := internal.NewRouter(
 		cfg.routerThreshold,
 		workerConf.channelLen,
-		channel,
+		channelSlice,
 		paymentClients.primary,
 		paymentClients.fallback,
 	)
 
-	return internal.NewPaymentHandler(ctx, router, workerConf.numWorkers, channel, logger, dbClient)
+	return internal.NewPaymentHandler(ctx, router, workerConf.numWorkers, channelSlice, logger, dbClient)
 }
 
 func (s *Server) Shutdown(ctx context.Context) {
@@ -263,7 +267,7 @@ func main() {
 		slog.String("payments_endpoint", "http://localhost:"+server.port+"/payments"),
 	)
 
-	go readMetrics()
+	// go readMetrics()
 
 	signalChannel := make(chan os.Signal, 1)
 	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
@@ -275,69 +279,17 @@ func main() {
 		}
 	}()
 
-	go func() {
-		err := http.ListenAndServe(":6060", nil)
-		if err != nil {
-			panic(err)
-		}
-	}()
+	// go func() {
+	// 	err := http.ListenAndServe(":6060", nil)
+	// 	if err != nil {
+	// 		panic(err)
+	// 	}
+	// }()
 
 	<-signalChannel
 	server.logger.InfoContext(ctx, "Stopping server")
 
 	server.Shutdown(ctx)
-}
-
-func readMetrics() {
-	interval := 2 * time.Second
-
-	descs := metrics.All()
-	// Prepare stable, sorted order for display.
-	names := make([]string, 0, len(descs))
-	for _, d := range descs {
-		names = append(names, d.Name)
-	}
-	sort.Strings(names)
-
-	// Prebuild sample slice once (no per-tick allocs).
-	samples := make([]metrics.Sample, len(names))
-	for i, n := range names {
-		samples[i].Name = n
-	}
-
-	var lastLines int
-
-	for {
-		metrics.Read(samples)
-
-		// Build table lines.
-		lines := make([]string, 0, len(samples)+3)
-		header := fmt.Sprintf("Go runtime/metrics — %s", time.Now().Format(time.RFC3339))
-		sep := repeat('-', 80)
-		lines = append(lines, header, sep)
-		lines = append(lines, fmt.Sprintf("%-64s | %s", "KEY", "VALUE"))
-		lines = append(lines, sep)
-
-		for _, s := range samples {
-			val := formatSampleValue(s)
-			lines = append(lines, fmt.Sprintf("%-64s | %s", s.Name, val))
-		}
-
-		// --- Overwrite previous frame (move cursor up + clear) ---
-		// Move the cursor up by the number of lines printed last time.
-		if lastLines > 0 {
-			fmt.Printf("\x1b[%dA", lastLines) // cursor up N lines
-			fmt.Printf("\x1b[J")              // clear from cursor to end of screen
-		}
-
-		// Print current frame.
-		for _, ln := range lines {
-			fmt.Printf("%s\n", ln)
-		}
-		lastLines = len(lines)
-
-		time.Sleep(interval)
-	}
 }
 
 func (s *Server) HandlerFunc(ctx *fasthttp.RequestCtx) {
@@ -440,77 +392,4 @@ func parseTimeRange(fromStr, toStr string) (time.Time, time.Time, error) {
 	}
 
 	return from, toTime, nil
-}
-
-func formatSampleValue(s metrics.Sample) string {
-	switch s.Value.Kind() {
-	case metrics.KindUint64:
-		return fmt.Sprintf("%d", s.Value.Uint64())
-	case metrics.KindFloat64:
-		return fmt.Sprintf("%.6g", s.Value.Float64())
-	case metrics.KindFloat64Histogram:
-		h := s.Value.Float64Histogram()
-		total := uint64(0)
-		for _, c := range h.Counts {
-			total += c
-		}
-		// Compact summary (you can change which quantiles to show)
-		p50 := histQuantile(h, 0.50)
-		p90 := histQuantile(h, 0.90)
-		p99 := histQuantile(h, 0.99)
-		return fmt.Sprintf("count=%d p50=%.6g p90=%.6g p99=%.6g", total, p50, p90, p99)
-	default:
-		return "<unknown>"
-	}
-}
-
-func histQuantile(h *metrics.Float64Histogram, q float64) float64 {
-	if h == nil || len(h.Counts) == 0 {
-		return 0
-	}
-	var total uint64
-	for _, c := range h.Counts {
-		total += c
-	}
-	if total == 0 {
-		return 0
-	}
-	target := uint64(float64(total-1) * q)
-
-	var cum uint64
-	for i, c := range h.Counts {
-		if c == 0 {
-			continue
-		}
-		next := cum + c
-		if target < next {
-			var lo, hi float64
-			if i == 0 {
-				// For -Inf bucket, just anchor to first bound distance.
-				lo = h.Buckets[0] - 1
-			} else {
-				lo = h.Buckets[i-1]
-			}
-			if i == len(h.Buckets) {
-				hi = h.Buckets[len(h.Buckets)-1] + 1
-			} else {
-				hi = h.Buckets[i]
-			}
-			inBucket := float64(target-cum) / float64(c)
-			return lo + (hi-lo)*inBucket
-		}
-		cum = next
-	}
-	if len(h.Buckets) > 0 {
-		return h.Buckets[len(h.Buckets)-1]
-	}
-	return 0
-}
-
-func repeat(ch rune, n int) string {
-	b := make([]rune, n)
-	for i := range b {
-		b[i] = ch
-	}
-	return string(b)
 }

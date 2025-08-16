@@ -5,12 +5,12 @@ type Router struct {
 	paymentProcessorClient         *PaymentClient
 	paymentProcessorFallbackClient *PaymentClient
 	threshold                      int
-	pendingPaymentChan             chan []byte
+	pendingPaymentChanSlice        [4]chan []byte
 	bufSize                        int
 }
 
 // NewRouter creates a new Router instance.
-func NewRouter(threshold, bufSize int, pendingPaymentChan chan []byte,
+func NewRouter(threshold, bufSize int, pendingPaymentChanSlice [4]chan []byte,
 	paymentProcessorClient, paymentProcessorFallbackClient *PaymentClient,
 ) *Router {
 	return &Router{
@@ -18,7 +18,7 @@ func NewRouter(threshold, bufSize int, pendingPaymentChan chan []byte,
 		paymentProcessorFallbackClient: paymentProcessorFallbackClient,
 		threshold:                      threshold,
 		bufSize:                        bufSize,
-		pendingPaymentChan:             pendingPaymentChan,
+		pendingPaymentChanSlice:        pendingPaymentChanSlice,
 	}
 }
 
@@ -31,7 +31,12 @@ func (r *Router) Shutdown() {
 func (r *Router) route() *PaymentClient {
 	const percentMultiplier = 100
 
-	channelUsage := len(r.pendingPaymentChan) * percentMultiplier / r.bufSize
+	sumLen := 0
+	for i := range len(r.pendingPaymentChanSlice) {
+		sumLen += len(r.pendingPaymentChanSlice[i])
+	}
+
+	channelUsage := sumLen * percentMultiplier / r.bufSize
 
 	if r.paymentProcessorClient.health.Load() || channelUsage <= r.threshold {
 		return r.paymentProcessorClient

@@ -24,11 +24,11 @@ var ErrDBClientUnavailable = errors.New("database client not available")
 // PaymentHandler manages payment processing with primary and fallback clients
 // using a fan-in/fan-out pattern for latency.
 type PaymentHandler struct {
-	router             *Router
-	logger             *slog.Logger
-	pendingPaymentChan chan []byte
-	shutdown           chan struct{}
-	dbClient           DBClient
+	router                  *Router
+	logger                  *slog.Logger
+	pendingPaymentChanSlice [4]chan []byte
+	shutdown                chan struct{}
+	dbClient                DBClient
 }
 
 // NewPaymentHandler creates a new payment handler with the specified clients and worker configuration.
@@ -36,16 +36,16 @@ type PaymentHandler struct {
 func NewPaymentHandler(ctx context.Context,
 	router *Router,
 	numWorkers int,
-	pendingChan chan []byte,
+	pendingPaymentChanSlice [4]chan []byte,
 	logger *slog.Logger,
 	dbClient DBClient,
 ) *PaymentHandler {
 	payment := &PaymentHandler{
-		router:             router,
-		logger:             logger,
-		pendingPaymentChan: pendingChan,
-		shutdown:           make(chan struct{}),
-		dbClient:           dbClient,
+		router:                  router,
+		logger:                  logger,
+		pendingPaymentChanSlice: pendingPaymentChanSlice,
+		shutdown:                make(chan struct{}),
+		dbClient:                dbClient,
 	}
 
 	for range numWorkers {
@@ -74,15 +74,18 @@ const (
 
 // ProcessPayment adds a payment request to the pending channel for processing.
 func (p *PaymentHandler) ProcessPayment(ctx context.Context, request []byte) error {
-	p.logger.DebugContext(ctx, "received request, adding into channel",
-		slog.Int("channel_len", len(p.pendingPaymentChan)))
-
 	ticker := time.NewTicker(tickerInterval * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case p.pendingPaymentChan <- request:
+		case p.pendingPaymentChanSlice[0] <- request:
+			return nil
+		case p.pendingPaymentChanSlice[1] <- request:
+			return nil
+		case p.pendingPaymentChanSlice[2] <- request:
+			return nil
+		case p.pendingPaymentChanSlice[3] <- request:
 			return nil
 		case <-ticker.C:
 			// p.logger.WarnContext(ctx, "taking too long to add request on channel",
@@ -117,43 +120,53 @@ func (p *PaymentHandler) Shutdown() {
 func (p *PaymentHandler) processPaymentWorker(ctx context.Context) {
 	for {
 		select {
-		case data := <-p.pendingPaymentChan:
-			var request *PaymentRequest
-
-			err := json.NewDecoder(bytes.NewReader(data)).Decode(&request)
-			if err != nil {
-				p.logger.ErrorContext(ctx, fmt.Sprintf("error decoding json body %v", err))
-			}
-
-			routeClientAndSendRequest := func() error {
-				client := p.router.route()
-
-				if client == p.router.paymentProcessorClient {
-					request.TypeClient = PaymentTypeDefault
-				} else {
-					request.TypeClient = PaymentTypeFallback
-				}
-
-				p.logger.InfoContext(ctx, "Processing payment",
-					slog.String("correlationId", request.CorrelationID),
-					slog.String("amount", request.Amount.String()))
-
-				return client.processPayment(ctx, request)
-			}
-			persistRequestInDatabase := func() error {
-				return p.sendToDB(ctx, request)
-			}
-
-			// We must retry until the both func's are successfully done
-			retryEngine(routeClientAndSendRequest)
-			retryEngine(persistRequestInDatabase)
-
-			p.logger.InfoContext(ctx, "Payment processor succeeded",
-				slog.String("correlationId", request.CorrelationID))
+		case data := <-p.pendingPaymentChanSlice[0]:
+			p.process(ctx, data)
+		case data := <-p.pendingPaymentChanSlice[1]:
+			p.process(ctx, data)
+		case data := <-p.pendingPaymentChanSlice[2]:
+			p.process(ctx, data)
+		case data := <-p.pendingPaymentChanSlice[3]:
+			p.process(ctx, data)
 		case <-p.shutdown:
 			return
 		}
 	}
+}
+
+func (p *PaymentHandler) process(ctx context.Context, data []byte) {
+	var request *PaymentRequest
+
+	err := json.NewDecoder(bytes.NewReader(data)).Decode(&request)
+	if err != nil {
+		p.logger.ErrorContext(ctx, fmt.Sprintf("error decoding json body %v", err))
+	}
+
+	routeClientAndSendRequest := func() error {
+		client := p.router.route()
+
+		if client == p.router.paymentProcessorClient {
+			request.TypeClient = PaymentTypeDefault
+		} else {
+			request.TypeClient = PaymentTypeFallback
+		}
+
+		p.logger.InfoContext(ctx, "Processing payment",
+			slog.String("correlationId", request.CorrelationID),
+			slog.String("amount", request.Amount.String()))
+
+		return client.processPayment(ctx, request)
+	}
+	persistRequestInDatabase := func() error {
+		return p.sendToDB(ctx, request)
+	}
+
+	// We must retry until the both func's are successfully done
+	retryEngine(routeClientAndSendRequest)
+	retryEngine(persistRequestInDatabase)
+
+	p.logger.InfoContext(ctx, "Payment processor succeeded",
+		slog.String("correlationId", request.CorrelationID))
 }
 
 func (p *PaymentHandler) sendToDB(ctx context.Context, request *PaymentRequest) error {
