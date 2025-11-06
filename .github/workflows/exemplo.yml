@@ -1,0 +1,39 @@
+name: exemplo go
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-test-deploy:
+    name: build-test-deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Chekcout code
+        uses: actions/checkout@v4
+      - name: setup go
+        uses: actions/setup-go@v5
+        with:
+          goversion: '1.24'
+
+      - name: Install dependencies
+        run: echo "go mod download"
+
+      - name: Verify dependencies
+        run: echo "go mod verify"
+  notification:
+    name: notification
+    runs-on: ubuntu-latest
+    needs: build-test-deploy
+    steps:
+      - name: send notification
+        run: echo sending...
+  example:
+    name: example
+    runs-on: ubuntu-latest
+    needs: [build-test-deploy,notification]
+    steps:
+      - name: send notification
+        run: ok...

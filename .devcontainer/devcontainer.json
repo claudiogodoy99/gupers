@@ -1,0 +1,14 @@
+{
+    "name": "Exemplo",
+    "_____": "mcr.microsoft.com/devcontainers/go:1-1.23-bookworm",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "golang.go"
+            ],
+            "settings": {
+                "editor.formatOnSave": true
+            }
+        }
+    }
+}
