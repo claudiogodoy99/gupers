@@ -23,6 +23,13 @@ jobs:
 
       - name: Verify dependencies
         run: echo "go mod verify"
+  example2:
+    name: example2
+    runs-on: ubuntu-latest
+    steps:
+      - name: send notification
+        run: echo ok...
+
   notification:
     name: notification
     runs-on: ubuntu-latest
@@ -30,10 +37,12 @@ jobs:
     steps:
       - name: send notification
         run: echo sending...
+
   example:
     name: example
     runs-on: ubuntu-latest
-    needs: [build-test-deploy,notification]
+    needs: [example2,notification]
     steps:
       - name: send notification
-        run: ok...
+        run: echo ok...
+  
